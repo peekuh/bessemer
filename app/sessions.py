@@ -44,6 +44,10 @@ class Session:
     """Queue whose alert the agent is writing right now, for the UI."""
     narrate: bool = True
     """Whether live runs call the model. Tests turn this off."""
+    narrating_since: datetime | None = None
+    recording_stale: bool = False
+    """Set on reset. The old recording stays for playback until the next live
+    capture, which then starts a fresh one rather than mixing two runs."""
 
     @property
     def key(self) -> str:

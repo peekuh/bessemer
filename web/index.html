@@ -166,6 +166,8 @@
   .track .marks i.warn { background: var(--amber); }
   .track .marks i.ok { background: var(--green); }
   .track .marks i.mark { background: var(--ink); width: 4px; height: 14px; border-radius: 2px; top: -5px; border: 0; }
+  .track .marks i.check { width: 16px; height: 16px; top: -6px; background: var(--paper); border: 3px solid var(--ink); }
+  .dot.check { background: var(--ink); }
   .track .ticks { display: flex; justify-content: space-between; color: var(--ink-3); font-size: 11.5px; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .landmark {
     display: flex; align-items: center; gap: 10px; margin-top: 10px; min-height: 30px;
@@ -662,24 +664,38 @@
   // -------------------------------------------------------- live / playback
   const START_MIN = 7 * 60 + 30;
   let live = false;
+  // The five beats of the story. Always on the track, always clickable, so a
+  // presenter can run to them in live mode before they have "happened".
+  const CHECKPOINTS = [
+    { time: "07:30", label: "Quiet. Nothing to say", kind: "check" },
+    { time: "08:05", label: "One vendor's cab has not left", kind: "check" },
+    { time: "08:30", label: "Two riders not collected, one on leave", kind: "check" },
+    { time: "08:55", label: "Five minutes to shift start", kind: "check" },
+    { time: "09:30", label: "Two queues, two endings", kind: "check" },
+  ];
   let landmarks = [];
   let cursor = "07:30";       // where the slider is
   let playbackTimer = null;
   const minToHHMM = (m) => `${String(Math.floor((START_MIN + m) / 60)).padStart(2, "0")}:${String((START_MIN + m) % 60).padStart(2, "0")}`;
   const hhmmToMin = (t) => (Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5))) - START_MIN;
 
+  function allMarks() {
+    const seen = new Set(CHECKPOINTS.map((c) => c.time));
+    return [...CHECKPOINTS, ...landmarks.filter((m) => !seen.has(m.time))].sort((a, b) => a.time.localeCompare(b.time));
+  }
+
   function setCursor(hhmm) {
     cursor = hhmm;
     $("scrub").value = hhmmToMin(hhmm);
     $("story-now").textContent = hhmm;
-    const here = landmarks.filter((m) => m.time <= hhmm).slice(-1)[0];
+    const here = allMarks().filter((m) => m.time <= hhmm).slice(-1)[0];
     $("story-what").innerHTML = here
       ? `<span class="dot ${here.kind === "mark" ? "" : here.kind}"></span>${esc(here.label)}${here.time !== hhmm ? ` <span class="muted">at ${here.time}</span>` : ""}`
       : `<span class="muted">Before anything happened</span>`;
   }
 
   function renderMarks() {
-    $("marks").innerHTML = landmarks.map((m) => {
+    $("marks").innerHTML = allMarks().map((m) => {
       const pct = (hhmmToMin(m.time) / 150) * 100;
       return `<i class="${m.kind}" style="left:${pct}%" title="${esc(m.time)} ${esc(m.label)}"></i>`;
     }).join("");
@@ -705,17 +721,25 @@
   }
 
   // --- live: run the clock forward to a minute, then the agent writes
+  let jumping = false;
   async function jumpLive(hhmm) {
+    if (jumping) { toast("Still writing. Wait for it to finish."); return; }
+    jumping = true;
     setCursor(hhmm);
     $("story-state").textContent = `Running to ${hhmm}`;
     $("track").classList.add("disabled");
-    showWriting(true, "Computing the floor, then writing");
+    document.querySelectorAll("#play, #reset, #lm-prev, #lm-next").forEach((b) => b.disabled = true);
+    showWriting(true, "Computing the floor");
     try {
       await post(`/replay/start?to=${hhmm}&speed=${speed}`);
+    } catch (e) {
+      toast("The jump failed. Try again.");
     } finally {
+      jumping = false;
       $("track").classList.remove("disabled");
-      showWriting(false);
-      await refresh(); await loadLandmarks();
+      document.querySelectorAll("#play, #reset, #lm-prev, #lm-next").forEach((b) => b.disabled = false);
+      await refresh();
+      renderMarks();
       $("story-state").textContent = "Live";
     }
   }
@@ -726,10 +750,11 @@
   }
 
   function stepLandmark(dir) {
-    if (!landmarks.length) return;
+    // Previous / Next and the arrow keys walk the five story checkpoints.
+    // The finer landmarks stay on the track as clickable dots.
     const next = dir > 0
-      ? landmarks.find((m) => m.time > cursor)
-      : landmarks.slice().reverse().find((m) => m.time < cursor);
+      ? CHECKPOINTS.find((m) => m.time > cursor)
+      : CHECKPOINTS.slice().reverse().find((m) => m.time < cursor);
     if (next) goTo(next.time);
   }
 
@@ -751,17 +776,25 @@
     }, 1000 / (speed / 60));
   }
 
-  function setLive(on) {
+  async function setLive(on) {
     live = on;
     $("live").checked = on;
     $("story").classList.toggle("is-live", on);
     if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; }
     $("play").textContent = "Play";
+    showWriting(false);
+    events.length = 0; lastEvent = null;
     if (on) {
+      // A clean slate, so anything that appears from here on was generated
+      // in front of the audience. The previous run stays available to
+      // playback until the first live minute is captured.
+      $("story-state").textContent = "Starting the morning over";
+      await post(`/replay/reset?clear_cover=true`);
+      setCursor("07:30");
+      await refresh();
       $("story-state").textContent = "Live. Click a dot to run there and watch the agent write.";
-      refresh();
     } else {
-      showRecorded(cursor);
+      await showRecorded("07:30");
     }
     loadLandmarks();
   }
@@ -769,13 +802,20 @@
   $("live").addEventListener("change", (ev) => setLive(ev.target.checked));
   $("play").addEventListener("click", play);
   $("reset").addEventListener("click", async () => {
-    if (live) { await post(`/replay/reset?clear_cover=true`); events.length = 0; lastEvent = null; refresh(); }
-    goTo("07:30");
+    if (live) { await setLive(true); return; }
+    showRecorded("07:30");
   });
   $("scrub").addEventListener("input", (ev) => { if (!live) showRecorded(minToHHMM(Number(ev.target.value))); else setCursor(minToHHMM(Number(ev.target.value))); });
   $("scrub").addEventListener("change", (ev) => { if (live) jumpLive(minToHHMM(Number(ev.target.value))); });
   $("marks").style.pointerEvents = "auto";
   $("marks").addEventListener("click", (ev) => { const i = ev.target.closest("i"); if (!i) return; goTo(i.title.slice(0, 5)); });
+  // Dots must be clickable, but the slider sits above them. Let clicks fall through
+  // to the marks layer where a dot is under the pointer.
+  $("scrub").addEventListener("pointerdown", (ev) => {
+    const rect = $("marks").getBoundingClientRect();
+    const hit = allMarks().find((m) => Math.abs(rect.left + (hhmmToMin(m.time) / 150) * rect.width - ev.clientX) < 9);
+    if (hit) { ev.preventDefault(); goTo(hit.time); }
+  });
   $("lm-prev").addEventListener("click", () => stepLandmark(-1));
   $("lm-next").addEventListener("click", () => stepLandmark(1));
   document.addEventListener("keydown", (ev) => {
@@ -806,8 +846,14 @@
       renderFeed(feed);
       setCursor(board.time);
       $("play").textContent = board.running ? "Pause" : "Play";
-      showWriting(!!board.narrating, board.narrating ? `Writing the ${board.narrating} alert` : "");
-      if (board.narrating) $("story-state").textContent = "Live. The clock is paused while the agent writes.";
+      if (board.narrating) {
+        showWriting(true, `Writing the ${board.narrating} alert`);
+        $("story-state").textContent = "Live. The clock is paused while the agent writes.";
+      } else if (jumping) {
+        showWriting(true, "Computing the floor");
+      } else {
+        showWriting(false);
+      }
     } catch (e) {
       $("headline").textContent = "Cannot reach the API";
       $("subline").textContent = "Start it with: uv run uvicorn app.api:app --port 8000";
@@ -818,8 +864,8 @@
     landmarks = []; loadLandmarks();
     if (b.recording && b.recording.ready) { setLive(false); } else { setLive(true); }
   }).catch(() => setLive(true));
-  setInterval(() => { if (live && running) refresh(); }, 1000);
-  setInterval(() => { if (live && !running) refresh(); }, 5000);
+  setInterval(() => { if (live && (running || jumping)) refresh(); }, 1000);
+  setInterval(() => { if (live && !running && !jumping) refresh(); }, 5000);
 })();
 </script>
 </body>

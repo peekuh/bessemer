@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -165,10 +166,11 @@ def conversation_id(session: Session) -> str:
 def task_conversation_id(session: Session, alert_id: int) -> str:
     """A throwaway conversation for one alert write-up.
 
-    Keyed by alert and clock so a re-narration later in the morning starts
-    clean rather than inheriting the earlier one.
+    Unique per call. An earlier version keyed on alert and minute, and two
+    write-ups of the same alert inside one minute collided on the same ADK
+    session id, which surfaced as "Session ... not found" mid-run.
     """
-    return f"{conversation_id(session)}:task:{alert_id}:{session.replay.now:%H%M}"
+    return f"{conversation_id(session)}:task:{alert_id}:{session.replay.now:%H%M}:{uuid.uuid4().hex[:6]}"
 
 
 async def _ensure_conversation(session: Session, user_id: str, sid: str) -> str:
@@ -256,22 +258,27 @@ async def compose(
         f" at {session.replay.now:%H:%M}. Write it up for the line manager and "
         f"save it with compose_alert."
     )
-    try:
-        await asyncio.wait_for(
-            _invoke(
-                session,
-                user_id,
-                prompt,
-                reason=f"compose:{alert.status.value}",
-                sid=task_conversation_id(session, alert_id),
-                agent=narrator_agent,
-            ),
-            timeout=INVOCATION_TIMEOUT_S,
-        )
-    except Exception as exc:  # noqa: BLE001 - the board must survive any failure here
-        USAGE.failures += 1
-        log.warning("narrative generation failed for alert %s: %s", alert_id, exc)
-        return False
+    # One retry. The failures seen in practice were transient session lookups,
+    # not model refusals, and a second attempt with a fresh task id succeeds.
+    for attempt in (1, 2):
+        try:
+            await asyncio.wait_for(
+                _invoke(
+                    session,
+                    user_id,
+                    prompt,
+                    reason=f"compose:{alert.status.value}",
+                    sid=task_conversation_id(session, alert_id),
+                    agent=narrator_agent,
+                ),
+                timeout=INVOCATION_TIMEOUT_S,
+            )
+            break
+        except Exception as exc:  # noqa: BLE001 - the board must survive any failure here
+            USAGE.failures += 1
+            log.warning("narrative generation failed for alert %s (attempt %d): %s", alert_id, attempt, exc)
+            if attempt == 2:
+                return False
 
     return alert.narrative is not None
 

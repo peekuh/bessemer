@@ -67,8 +67,9 @@ class Recording:
 def capture(session) -> None:
     """Snapshot the session's current tick into its recording."""
     replay = session.replay
-    if session.recording is None:
+    if session.recording is None or session.recording_stale:
         session.recording = Recording(key=session.key)
+        session.recording_stale = False
     session.recording.snapshots[replay.now.strftime("%H:%M")] = {
         "clock": replay.now.isoformat(),
         "time": replay.now.strftime("%H:%M"),

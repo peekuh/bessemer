@@ -107,18 +107,23 @@ async def _narrate_now(session: Session, force: bool = False) -> None:
         if not force and not alert.needs_narrative(session.replay.now):
             continue
         session.narrating = queue
+        session.narrating_since = datetime.now()
         try:
             await agent_runner.compose(session, alert, fresh=True)
         except Exception:  # noqa: BLE001 - the board outlives the model
             pass
         finally:
             session.narrating = None
+            session.narrating_since = None
         session.persist()
 
 
 async def _run(session: Session) -> None:
     """Advance the clock at the session's speed, narrating and capturing."""
     try:
+        if session.recording_stale or session.recording is None:
+            session.persist()
+            rec.capture(session)
         for tick in session.replay.ticks():
             if tick <= session.replay.now:
                 continue
@@ -135,6 +140,9 @@ async def _run(session: Session) -> None:
 
 
 def _advance_to(session: Session, target: datetime) -> None:
+    if session.recording_stale or session.recording is None:
+        session.persist()
+        rec.capture(session)  # the opening minute, before anything moves
     for tick in session.replay.ticks():
         if tick <= session.replay.now:
             continue
@@ -216,6 +224,8 @@ async def reset_replay(
     if clear_cover:
         store.clear_cover_log(scope.shift_date)
     fresh = scope.session()
+    fresh.recording_stale = True
+    fresh.narrate = True
     return {"status": "reset", "alerts_cleared": removed, "clock": fresh.replay.now.isoformat()}
 
 
@@ -236,7 +246,8 @@ def _restart(session: Session) -> Session:
     fresh = get_session(r.business_unit, r.office, r.shift_date, r.shift_type)
     fresh.speed = session.speed
     fresh.narrate = session.narrate
-    fresh.recording = recording  # keep capturing into the same recording
+    fresh.recording = recording
+    fresh.recording_stale = True  # a rewind is a new run; start a fresh recording
     return fresh
 
 
@@ -249,6 +260,9 @@ async def board(scope: Scope = Depends()) -> dict[str, Any]:
     payload = session.replay.board()
     payload["running"] = session.running
     payload["speed"] = session.speed
+    # A flag older than the model timeout is a leak, not a write in progress.
+    if session.narrating and session.narrating_since and (datetime.now() - session.narrating_since).total_seconds() > 120:
+        session.narrating = None
     payload["narrating"] = session.narrating
     payload["recording"] = session.recording.status() if session.recording else {"ready": False}
     return payload
