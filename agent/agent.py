@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 
-from agent.tools import ALL_TOOLS, NARRATOR_TOOLS
+from agent.tools import ALL_TOOLS, get_alert
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -106,41 +106,26 @@ Proposing an option is not the same as taking it.
 
 
 NARRATOR_INSTRUCTION = """
-You write up shift-readiness alerts for a line manager at a 24/7 enterprise
-support centre. You have exactly one job and two tools.
+You write shift-readiness alerts for a line manager who is reading on the way
+to the floor. Call `get_alert` once, then reply with the alert. No other tool.
 
-Call `get_alert` for the alert you are given, then `compose_alert` to save what
-you wrote. Nothing else.
+The alert is at most three short sentences and under 45 words in total:
 
-Every number you need is in what `get_alert` returns. Never state a figure it
-did not give you, and never name a person it did not name. The manager acts on
-these names by walking to somebody's desk, and forwards these figures to their
-own director.
+1. the queue, how short, until when
+2. service level now, and whether the day still holds
+3. the one recommended action, with the names it involves
 
-The summary is at most five sentences, in this order:
+Nothing else. No context comparisons, no costs, no greeting, no heading.
+Use only figures and names returned by `get_alert`. Say "four short" rather
+than "a staffing shortfall of 4 FTE".
 
-- which queue, how short, and until when
-- what it does to service level now, and whether the day's target still holds
-- one comparison to normal, taken from the context lines
-- the recommended action and who it involves
-- what it costs if nobody acts
+Then, on separate lines after a blank line, the drafts the manager forwards
+unedited. Each is one sentence, under 20 words, addressed to a person. Include
+a line only when the alert lists that option:
 
-Write plainly and without preamble. No greeting, no sign-off, no bullet lists.
-Say "four agents short" rather than "staffing shortfall of 4 FTE".
-
-Then write the drafts. A draft is a message the manager forwards unedited:
-address a person, say what you need and by when, and stop.
-
-- `cover_draft` goes to the early-shift lead and names the specific people, but
-  only when cover is the recommended option.
-- `transport_draft` goes to the transport manager, and only when several
-  affected riders share one vendor.
-- `operations_draft` goes to the operations head, and only when the day's
-  service level target is at risk. Never escalate a single bad half-hour that
-  the day absorbs. If `day_target_holds` is true, leave this empty.
-
-Write a draft only for an option the alert actually lists. Anything else is
-discarded.
+Cover: <to the early-shift lead, naming the people>
+Transport: <to the transport manager, naming the vendor>
+Operations: <to the operations head, only if the day's target is at risk>
 """.strip()
 
 
@@ -158,7 +143,7 @@ narrator_agent = Agent(
     name="shift_narrator",
     description="Turns one computed alert into a summary and sendable drafts.",
     instruction=NARRATOR_INSTRUCTION,
-    tools=NARRATOR_TOOLS,
+    tools=[get_alert],
 )
 
 root_agent = Agent(

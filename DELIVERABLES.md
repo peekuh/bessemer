@@ -87,13 +87,14 @@ Narrative present and naming only real people. Chat answers from the board. Abou
 - [x] `db/seed_story.py` — the designed morning: five beats, each a different cause and pathway, in the dataset's schema
 - [x] Live switch: live runs compute and call the model fresh at every checkpoint, clock paused while it writes; playback reads the recording of the last live run
 - [x] `app/recording.py` — every live tick captured and saved to Postgres; landmarks derived from the feed
+- [x] Streaming: narrator writes plain text so it streams; one server-sent event stream carries clock, phase and tokens; alerts capped at 45 words
 - [x] Classification fixes the story exposed: affected set on the median, `LATE_PICKUP` for a cab running behind, vendors only blamed for transport-caused lateness, permanent absence priced across the shift
 - [x] "On the way" bucket fixed: counts now add up to the roster at every minute
 - [x] Narrative memo moved to its own table so Start over does not throw it away
 - [x] `schema.sql` brought back in line with the live database (night role, synthetic flag, action cost)
 - [x] `tests/test_recording.py` — 7 checks including the five story beats
 
-**Check**: a teammate who has not seen the code follows the README and reaches beat 4 in under 5 minutes. `uv run pytest tests/ -m "not live"` passes 106.
+**Check**: a teammate who has not seen the code follows the README and reaches beat 4 in under 5 minutes. `uv run pytest tests/ -m "not live"` passes 109.
 
 ## Cut order if behind
 

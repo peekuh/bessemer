@@ -257,6 +257,13 @@
   .narrative { font-size: 14.5px; line-height: 1.55; color: var(--ink); }
   .narrative.pending { color: var(--ink-3); }
   .narrative.history { color: var(--ink-2); font-size: 13.5px; }
+  #writing-live { background: var(--red-tint); }
+  .stream-block + .stream-block { margin-top: 16px; }
+  .stream-block h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .stream-block h3 .pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: pulse 1s infinite; }
+  .stream-text { font-size: 15px; line-height: 1.55; white-space: pre-wrap; min-height: 1.5em; }
+  .stream-text::after { content: "▍"; color: var(--red); animation: pulse .8s infinite; }
+  .stream-block.thinking .stream-text { color: var(--ink-3); font-style: italic; }
   .narrative.pending::after { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-left: 6px; animation: pulse 1.2s infinite; vertical-align: 2px; }
   @keyframes pulse { 0%,100% { opacity: .2 } 50% { opacity: 1 } }
   @media (prefers-reduced-motion: reduce) { .narrative.pending::after { animation: none; } }
@@ -380,6 +387,7 @@
   </div>
 
   <aside class="act">
+    <section id="writing-live" hidden></section>
     <section id="alert-panel">
       <div class="empty">No alert yet. The floor is on track.</div>
     </section>
@@ -726,6 +734,60 @@
     }
   }
 
+  // --- one event stream carries clock, phase and every token
+  let es = null;
+  function openStream() {
+    closeStream();
+    es = new EventSource(`${API}/stream`);
+    es.onmessage = (ev) => {
+      let e; try { e = JSON.parse(ev.data); } catch { return; }
+      if (!live) return;
+      if (e.kind === "status") {
+        if (e.phase === "computing") showWriting(true, `Running the clock to ${e.target || ""}`.trim());
+        else if (e.phase === "writing") { showWriting(true, `Writing the ${e.queue_name || e.queue} alert`); startStream(e.queue, e.queue_name); }
+        else showWriting(false);
+        if (e.clock) $("clock").textContent = e.clock;
+        if (e.partial) Object.entries(e.partial).forEach(([q, t]) => { if (t) { startStream(q, q); appendStream(q, t); } });
+      } else if (e.kind === "clock") {
+        $("clock").textContent = e.clock;
+        $("story-state").textContent = `Running the clock, ${e.clock}`;
+      } else if (e.kind === "token") {
+        appendStream(e.queue, e.text);
+      } else if (e.kind === "written") {
+        endStream(e.queue);
+        refresh();
+      } else if (e.kind === "positioned") {
+        showWriting(false);
+        $("writing-live").hidden = true; $("writing-live").innerHTML = "";
+        refresh();
+      }
+    };
+    es.onerror = () => { /* EventSource reconnects on its own */ };
+  }
+  function closeStream() { if (es) { es.close(); es = null; } $("writing-live").hidden = true; $("writing-live").innerHTML = ""; }
+
+  const QUEUE_NAMES = { billing: "Billing Support", techsupport: "Technical Support" };
+  function startStream(queue, name) {
+    const box = $("writing-live");
+    if (box.querySelector(`[data-queue="${queue}"]`)) return;
+    box.hidden = false;
+    box.insertAdjacentHTML("beforeend", `<div class="stream-block thinking" data-queue="${queue}">
+      <h3><span class="pulse"></span>${esc(QUEUE_NAMES[queue] || name || queue)}</h3>
+      <div class="stream-text">reading the alert</div></div>`);
+  }
+  function appendStream(queue, text) {
+    const block = $("writing-live").querySelector(`[data-queue="${queue}"]`);
+    if (!block) { startStream(queue, queue); return appendStream(queue, text); }
+    const t = block.querySelector(".stream-text");
+    if (block.classList.contains("thinking")) { block.classList.remove("thinking"); t.textContent = ""; }
+    t.textContent += text;
+  }
+  function endStream(queue) {
+    const block = $("writing-live").querySelector(`[data-queue="${queue}"]`);
+    if (block) block.remove();
+    if (!$("writing-live").children.length) $("writing-live").hidden = true;
+  }
+
   // --- live: run the clock forward to a minute, then the agent writes
   let jumping = false;
   async function jumpLive(hhmm) {
@@ -735,7 +797,7 @@
     $("story-state").textContent = `Running to ${hhmm}`;
     $("track").classList.add("disabled");
     document.querySelectorAll("#play, #reset, #lm-prev, #lm-next").forEach((b) => b.disabled = true);
-    showWriting(true, "Computing the floor");
+    showWriting(true, "Starting");
     try {
       await post(`/replay/start?to=${hhmm}&speed=${speed}`);
     } catch (e) {
@@ -797,9 +859,11 @@
       $("story-state").textContent = "Starting the morning over";
       await post(`/replay/reset?clear_cover=true`);
       setCursor("07:30");
+      openStream();
       await refresh();
       $("story-state").textContent = "Live. Click a dot to run there and watch the agent write.";
     } else {
+      closeStream();
       await showRecorded("07:30");
     }
     loadLandmarks();
@@ -851,14 +915,7 @@
       renderFeed(feed);
       setCursor(board.time);
       $("play").textContent = board.running ? "Pause" : "Play";
-      if (board.narrating) {
-        showWriting(true, `Writing the ${board.narrating} alert`);
-        $("story-state").textContent = "Live. The clock is paused while the agent writes.";
-      } else if (jumping) {
-        showWriting(true, "Computing the floor");
-      } else {
-        showWriting(false);
-      }
+      if (!board.narrating && !jumping && !board.running) showWriting(false);
     } catch (e) {
       if (!live || mine !== refreshSeq) return;
       showWriting(false);

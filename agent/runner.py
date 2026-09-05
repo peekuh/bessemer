@@ -55,6 +55,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from google.adk.agents import RunConfig
+from google.adk.agents.run_config import StreamingMode
 from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService
 from google.genai import types
@@ -199,44 +201,89 @@ async def _invoke(
     reason: str,
     sid: str | None = None,
     agent=None,
+    on_token=None,
 ) -> str:
     """Run one agent turn and return its final text.
 
-    The shift is bound for the duration of the call, so the tools can only
-    reach this tenant's data no matter what the model asks for.
+    With `on_token`, the model's reply is streamed and each delta is handed to
+    the callback as it arrives. The shift is bound for the duration, so the
+    tools can only reach this tenant's data.
     """
     sid = await _ensure_conversation(session, user_id, sid or conversation_id(session))
     message = types.Content(role="user", parts=[types.Part(text=text)])
+    config = RunConfig(streaming_mode=StreamingMode.SSE) if on_token else RunConfig()
 
     token = bind_session(session)
     started = time.perf_counter()
     prompt_tokens = completion_tokens = 0
-    reply: list[str] = []
+    streamed: list[str] = []
+    final: list[str] = []
     try:
         async for event in runner(agent).run_async(
-            user_id=user_id, session_id=sid, new_message=message
+            user_id=user_id, session_id=sid, new_message=message, run_config=config
         ):
             usage = getattr(event, "usage_metadata", None)
             if usage:
                 prompt_tokens += getattr(usage, "prompt_token_count", 0) or 0
                 completion_tokens += getattr(usage, "candidates_token_count", 0) or 0
-            if event.is_final_response() and event.content and event.content.parts:
-                reply.extend(p.text for p in event.content.parts if p.text)
+            if not (event.content and event.content.parts):
+                continue
+            chunk = "".join(p.text or "" for p in event.content.parts if p.text)
+            if getattr(event, "partial", False):
+                if chunk and on_token:
+                    streamed.append(chunk)
+                    on_token(chunk)
+            elif event.is_final_response() and chunk:
+                final.append(chunk)
     finally:
         unbind_session(token)
         USAGE.record(reason, time.perf_counter() - started, prompt_tokens, completion_tokens)
 
-    return "\n".join(reply).strip()
+    return ("\n".join(final) or "".join(streamed)).strip()
+
+
+DRAFT_KEYS = {
+    "cover": "EARLY_SHIFT_COVER",
+    "transport": "ESCALATE_TRANSPORT",
+    "operations": "ESCALATE_OPS",
+}
+
+
+def split_reply(text: str) -> tuple[str, dict[str, str]]:
+    """Separate the summary from the trailing draft lines.
+
+    Drafts are lines that start with Cover:, Transport: or Operations:. Anything
+    before the first of those is the summary the board shows.
+    """
+    summary: list[str] = []
+    drafts: dict[str, str] = {}
+    in_drafts = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        head, sep, body = stripped.partition(":")
+        key = head.strip().lower().rstrip("*").lstrip("*").strip()
+        if sep and key in DRAFT_KEYS:
+            in_drafts = True
+            if body.strip():
+                drafts[DRAFT_KEYS[key]] = body.strip()
+            continue
+        if in_drafts:
+            # A continuation line of the last draft.
+            if drafts and stripped:
+                last = list(drafts)[-1]
+                drafts[last] = f"{drafts[last]} {stripped}"
+            continue
+        summary.append(line)
+    return "\n".join(summary).strip(), drafts
 
 
 async def compose(
     session: Session, alert: Alert, user_id: str = "line_manager", fresh: bool = False
 ) -> bool:
-    """Write up one alert, unless the same situation has been written before.
+    """Write up one alert, streaming the words to the board as they arrive.
 
-    Returns True if the alert now carries prose, whether newly written or
-    reused. False means the model was unreachable and the board should fall
-    back to the structured payload.
+    Returns True if the alert now carries prose. False means the model was
+    unreachable twice and the board should fall back to the structured payload.
     """
     alert_id = session.alert_ids.get(alert.queue)
     if alert_id is None:
@@ -253,23 +300,27 @@ async def compose(
         return True
 
     prompt = (
-        f"Alert {alert_id} on the {alert.queue} queue has just "
-        f"{'opened' if alert.status.value == 'OPEN' else alert.status.value.lower()}"
-        f" at {session.replay.now:%H:%M}. Write it up for the line manager and "
-        f"save it with compose_alert."
+        f"Alert {alert_id} on the {alert.queue} queue, "
+        f"{'open' if alert.status.value == 'OPEN' else alert.status.value.lower()} "
+        f"at {session.replay.now:%H:%M}. Write it up."
     )
-    # One retry. The failures seen in practice were transient session lookups,
-    # not model refusals, and a second attempt with a fresh task id succeeds.
+    queue = alert.queue
+    session.partial[queue] = ""
+
+    def on_token(delta: str) -> None:
+        session.partial[queue] += delta
+        session.publish("token", queue=queue, text=delta)
+
+    reply = ""
     for attempt in (1, 2):
         try:
-            await asyncio.wait_for(
+            reply = await asyncio.wait_for(
                 _invoke(
-                    session,
-                    user_id,
-                    prompt,
+                    session, user_id, prompt,
                     reason=f"compose:{alert.status.value}",
                     sid=task_conversation_id(session, alert_id),
                     agent=narrator_agent,
+                    on_token=on_token,
                 ),
                 timeout=INVOCATION_TIMEOUT_S,
             )
@@ -277,10 +328,21 @@ async def compose(
         except Exception as exc:  # noqa: BLE001 - the board must survive any failure here
             USAGE.failures += 1
             log.warning("narrative generation failed for alert %s (attempt %d): %s", alert_id, attempt, exc)
+            session.partial[queue] = ""
             if attempt == 2:
                 return False
 
-    return alert.narrative is not None
+    summary, drafts = split_reply(reply)
+    if not summary:
+        return False
+    offered = {o.pathway.value for o in alert.options}
+    alert.narrative = summary
+    alert.drafts = {k: v for k, v in drafts.items() if k in offered}
+    alert.mark_narrated(session.replay.now)
+    store.save_alert(alert)
+    store.remember_narrative(alert.payload_hash(), alert.narrative, alert.drafts)
+    session.partial.pop(queue, None)
+    return True
 
 
 async def ask(session: Session, text: str, user_id: str = "line_manager") -> dict[str, Any]:

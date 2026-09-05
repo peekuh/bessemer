@@ -47,7 +47,7 @@ open http://localhost:8000
 Config lives in `app/config.py` and is overridable by environment variable. The demo defaults to `pinnacle-Slc`, `Clearwater Campus`, the `09:00` shift, on `2026-06-11`.
 
 ```bash
-uv run pytest tests/ -m "not live"    # 106 tests, no model calls, ~50s
+uv run pytest tests/ -m "not live"    # 109 tests, no model calls, ~55s
 uv run pytest tests/test_agent.py -m live   # 3 tests against the real model
 ```
 
@@ -55,7 +55,7 @@ uv run pytest tests/test_agent.py -m live   # 3 tests against the real model
 
 One slider, one switch.
 
-**Live on.** The clock is real and the model is called fresh every time. Click a dot on the slider to run the morning forward to that minute in about a second, then watch the agent write up whatever is open. The clock pauses while it writes, about fifteen seconds, and the panel says so. Press Play to run the whole morning instead. Everything a live run does is captured minute by minute.
+**Live on.** The clock is real and the model is called fresh every time. Click a checkpoint to run the morning forward to it, watching the clock tick, then watch the agent write the alert word by word in the right-hand panel. Status, clock and text all arrive on one event stream from the server, so the board can never show a stale state. Each write-up is under 45 words and takes five to ten seconds. Everything a live run does is captured minute by minute.
 
 **Live off.** The slider plays back the last live run. Instant, no compute, no model. Press Play to animate through it. If nothing has been recorded yet the panel says so and points at the switch.
 

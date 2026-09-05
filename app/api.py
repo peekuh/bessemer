@@ -19,6 +19,7 @@ Run:  uv run uvicorn app.api:app --port 8000
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app import recording as rec
 from app import store
@@ -101,11 +102,11 @@ class Scope:
 
 
 async def _narrate_now(session: Session, force: bool = False) -> None:
-    """Write up alerts, blocking the clock while the model works.
+    """Write up alerts, blocking the clock and streaming the words out.
 
-    Live mode always calls the model fresh; the memo is for nothing here.
-    `force` rewrites every open alert regardless of whether its situation
-    changed, which is what a presenter clicking a checkpoint wants to see.
+    Live mode always calls the model fresh. `force` rewrites every open alert
+    regardless of whether its situation changed, which is what a presenter
+    clicking a checkpoint wants to see.
     """
     from agent import runner as agent_runner
 
@@ -118,17 +119,24 @@ async def _narrate_now(session: Session, force: bool = False) -> None:
             continue
         session.narrating = queue
         session.narrating_since = datetime.now()
+        session.phase = "writing"
+        session.publish("status", phase="writing", queue=queue, queue_name=alert.display_name,
+                        clock=session.replay.now.strftime("%H:%M"))
         started = time.perf_counter()
         log.info("writing %s alert at %s (%s, %s%% coverage)", queue, session.replay.now.strftime("%H:%M"), alert.cause.value, alert.coverage_pct)
         try:
             ok = await agent_runner.compose(session, alert, fresh=True)
             log.info("%s %s alert in %.1fs", "wrote" if ok else "FAILED to write", queue, time.perf_counter() - started)
+            session.publish("written", queue=queue, ok=ok, narrative=alert.narrative, drafts=alert.drafts)
         except Exception as exc:  # noqa: BLE001 - the board outlives the model
             log.warning("FAILED to write %s alert: %s", queue, exc)
+            session.publish("written", queue=queue, ok=False)
         finally:
             session.narrating = None
             session.narrating_since = None
         session.persist()
+    session.phase = "idle"
+    session.publish("status", phase="idle", clock=session.replay.now.strftime("%H:%M"))
 
 
 async def _run(session: Session) -> None:
@@ -152,10 +160,15 @@ async def _run(session: Session) -> None:
         rec.save(session)
 
 
-def _advance_to(session: Session, target: datetime) -> None:
+async def _advance_to(session: Session, target: datetime) -> None:
+    """Run the clock forward to `target`, streaming the minutes as they pass."""
+    session.phase = "computing"
+    session.publish("status", phase="computing", target=target.strftime("%H:%M"),
+                    clock=session.replay.now.strftime("%H:%M"))
     if session.recording_stale or session.recording is None:
         session.persist()
         rec.capture(session)  # the opening minute, before anything moves
+    n = 0
     for tick in session.replay.ticks():
         if tick <= session.replay.now:
             continue
@@ -167,6 +180,10 @@ def _advance_to(session: Session, target: datetime) -> None:
         # and could not be acted on from playback.
         session.persist()
         rec.capture(session)
+        n += 1
+        if n % 3 == 0:
+            session.publish("clock", clock=tick.strftime("%H:%M"))
+            await asyncio.sleep(0)  # let the stream flush so the clock is seen moving
 
 
 # ------------------------------------------------------------------- control
@@ -191,10 +208,11 @@ async def start_replay(
         if session.task and not session.task.done():
             session.task.cancel()
             session.running = False
-        _advance_to(session, target)
+        await _advance_to(session, target)
         await _narrate_now(session, force=True)
         rec.capture(session)
         rec.save(session)
+        session.publish("positioned", clock=session.replay.now.strftime("%H:%M"))
         log.info("positioned at %s, recording saved", session.replay.now.strftime("%H:%M"))
         return {"status": "positioned", "clock": session.replay.now.isoformat()}
 
@@ -249,7 +267,9 @@ async def reset_replay(
 async def step_replay(minutes: int = Query(5, ge=1, le=180), scope: Scope = Depends()) -> dict[str, Any]:
     """Advance the clock by hand without narrating. Handy from curl."""
     session = scope.session()
-    _advance_to(session, session.replay.now + timedelta(minutes=minutes))
+    await _advance_to(session, session.replay.now + timedelta(minutes=minutes))
+    session.phase = "idle"
+    session.publish("status", phase="idle", clock=session.replay.now.strftime("%H:%M"))
     return {"status": "stepped", "clock": session.replay.now.isoformat()}
 
 
@@ -265,6 +285,40 @@ def _restart(session: Session) -> Session:
     fresh.recording = recording
     fresh.recording_stale = True  # a rewind is a new run; start a fresh recording
     return fresh
+
+
+# --------------------------------------------------------------------- stream
+
+
+@app.get("/stream", tags=["live"])
+async def stream(scope: Scope = Depends()) -> StreamingResponse:
+    """Server-sent events: clock ticks, phase changes, and the narrative as it
+    is written, token by token. One source of truth for the board's status, so
+    a late poll can never paint a stale label.
+    """
+    session = scope.session()
+    q = session.subscribe()
+
+    async def gen():
+        # Bring a late joiner up to date first.
+        yield _sse({"kind": "status", "phase": session.phase, "queue": session.narrating,
+                    "clock": session.replay.now.strftime("%H:%M"), "partial": session.partial})
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=15)
+                    yield _sse(event)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            session.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, default=str)}\n\n"
 
 
 # ---------------------------------------------------------------------- views

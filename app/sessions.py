@@ -45,6 +45,11 @@ class Session:
     narrate: bool = True
     """Whether live runs call the model. Tests turn this off."""
     narrating_since: datetime | None = None
+    phase: str = "idle"
+    """idle | computing | writing | done. Streamed to the board."""
+    partial: dict[str, str] = field(default_factory=dict)
+    """Text streamed so far per queue, for a client that connects mid-write."""
+    subscribers: list[asyncio.Queue] = field(default_factory=list)
     recording_stale: bool = False
     """Set on reset. The old recording stays for playback until the next live
     capture, which then starts a fresh one rather than mixing two runs."""
@@ -71,6 +76,24 @@ class Session:
 
     def id_for(self, queue: str) -> int | None:
         return self.alert_ids.get(queue)
+
+    def publish(self, kind: str, **data: Any) -> None:
+        """Push one event to every open stream. Never blocks the writer."""
+        event = {"kind": kind, **data}
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        self.subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        if q in self.subscribers:
+            self.subscribers.remove(q)
 
 
 def session_key(bu: str, office: str, shift_date: date, shift_type: str) -> str:

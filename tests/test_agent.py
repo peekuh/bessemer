@@ -222,8 +222,8 @@ def test_the_narrator_carries_only_the_tools_it_needs():
     never uses."""
     from agent.agent import narrator_agent, root_agent
 
-    assert len(narrator_agent.tools) == 2
-    assert {t.__name__ for t in narrator_agent.tools} == {"get_alert", "compose_alert"}
+    assert len(narrator_agent.tools) == 1
+    assert {t.__name__ for t in narrator_agent.tools} == {"get_alert"}
     assert len(root_agent.tools) > len(narrator_agent.tools)
 
 
@@ -303,3 +303,39 @@ def test_one_alert_costs_a_few_thousand_tokens_not_twenty(shift):
     asyncio.run(agent_runner.compose(shift, alert))
     spent = agent_runner.USAGE.prompt_tokens + agent_runner.USAGE.completion_tokens - before
     assert 0 < spent < 9_000, f"{spent} tokens for one alert is too many"
+
+
+# ------------------------------------------------------------ the reply format
+
+
+def test_the_reply_splits_into_a_short_summary_and_drafts():
+    """The narrator writes plain text so it can stream. The server takes the
+    drafts off the end and keeps the summary short."""
+    from agent.runner import split_reply
+
+    reply = (
+        "Billing is four short until 09:30. Service level 15% now; the day holds at 88%. "
+        "Move Agent 35, 27, 31 and 29 from the early shift.\n\n"
+        "Cover: Daniel, please put Agent 35, 27, 31 and 29 on Billing Support until 09:30.\n"
+        "Transport: Meera, four billing riders on Karan Mikhailov Travel were 38 minutes late."
+    )
+    summary, drafts = split_reply(reply)
+    assert len(summary.split()) < 45
+    assert "Cover:" not in summary
+    assert set(drafts) == {"EARLY_SHIFT_COVER", "ESCALATE_TRANSPORT"}
+    assert drafts["EARLY_SHIFT_COVER"].startswith("Daniel")
+
+
+def test_a_reply_with_no_drafts_is_all_summary():
+    from agent.runner import split_reply
+
+    summary, drafts = split_reply("Tech support is three short. The day is lost.")
+    assert summary.startswith("Tech support")
+    assert drafts == {}
+
+
+def test_bold_draft_labels_still_parse():
+    from agent.runner import split_reply
+
+    _, drafts = split_reply("Short.\n\n**Cover:** Daniel, two people please.\n**Operations:** Day at 53%.")
+    assert set(drafts) == {"EARLY_SHIFT_COVER", "ESCALATE_OPS"}
