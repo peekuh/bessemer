@@ -261,14 +261,9 @@
   .narrative { font-size: 14.5px; line-height: 1.55; color: var(--ink); }
   .narrative.pending { color: var(--ink-3); }
   .narrative.history { color: var(--ink-2); font-size: 13.5px; }
-  #writing-live { background: var(--red-tint); }
-  .stream-block + .stream-block { margin-top: 16px; }
-  .stream-block h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-  .stream-block h3 .pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: pulse 1s infinite; }
-  .stream-text { font-size: 15px; line-height: 1.55; white-space: pre-wrap; min-height: 1.5em; }
-  .stream-text::after { content: "▍"; color: var(--red); animation: pulse .8s infinite; }
-  .stream-block.thinking .stream-text { color: var(--ink-3); font-style: italic; }
   .narrative.pending::after { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-left: 6px; animation: pulse 1.2s infinite; vertical-align: 2px; }
+  .narrative.streaming::after { content: "▍"; color: var(--red); animation: pulse .8s infinite; margin-left: 1px; }
+  .narrative.streaming.waiting { color: var(--ink-3); font-style: italic; }
   @keyframes pulse { 0%,100% { opacity: .2 } 50% { opacity: 1 } }
   @media (prefers-reduced-motion: reduce) { .narrative.pending::after { animation: none; } }
   .context { margin: 12px 0 0; padding: 0; list-style: none; color: var(--ink-2); font-size: 13px; }
@@ -391,7 +386,6 @@
   </div>
 
   <aside class="act">
-    <section id="writing-live" hidden></section>
     <section id="alert-panel">
       <div class="empty">No alert yet. The floor is on track.</div>
     </section>
@@ -568,12 +562,27 @@
     // Once an alert resolves, the write-up describes a moment that has passed.
     // Show it as the morning's record rather than as a present-tense claim
     // that contradicts the "back to strength" line above it.
-    const narrative = resolved
-      ? `<p class="narrative">${esc(show.queue_name)} is back to strength. Nothing outstanding.</p>`
-        + (show.narrative ? `<h2 style="margin-top:14px">What happened</h2><p class="narrative history">${esc(show.narrative)}</p>` : "")
-      : show.narrative
-        ? `<p class="narrative">${esc(show.narrative)}</p>`
-        : `<p class="narrative pending">${esc(fallbackSummary(show))}</p>`;
+    // What goes in the narrative slot, in order of preference:
+    //   the written narrative; the words streaming in right now; in live mode
+    //   an empty slot waiting for the first token; in playback the structured
+    //   fallback. Nothing pre-written ever shows in live mode, so the audience
+    //   never sees text appear and then get replaced.
+    let narrative;
+    if (resolved) {
+      narrative = `<p class="narrative">${esc(show.queue_name)} is back to strength. Nothing outstanding.</p>`
+        + (show.narrative ? `<h2 style="margin-top:14px">What happened</h2><p class="narrative history">${esc(show.narrative)}</p>` : "");
+    } else if (show.narrative) {
+      narrative = `<p class="narrative">${esc(show.narrative)}</p>`;
+    } else if (partialText[show.queue] !== undefined) {
+      const text = partialText[show.queue];
+      narrative = text
+        ? `<p class="narrative streaming" data-queue="${show.queue}">${esc(text)}</p>`
+        : `<p class="narrative streaming waiting" data-queue="${show.queue}">reading the alert</p>`;
+    } else if (live) {
+      narrative = `<p class="narrative streaming waiting" data-queue="${show.queue}">waiting for the agent</p>`;
+    } else {
+      narrative = `<p class="narrative pending">${esc(fallbackSummary(show))}</p>`;
+    }
 
     const context = (show.context || []).slice(0, 3).map((c) => `<li>${esc(c.text)}</li>`).join("");
 
@@ -754,10 +763,10 @@
       if (!live) return;
       if (e.kind === "status") {
         if (e.phase === "computing") showWriting(true, `Running the clock to ${e.target || ""}`.trim());
-        else if (e.phase === "writing") { showWriting(true, `Writing the ${e.queue_name || e.queue} alert`); startStream(e.queue, e.queue_name); }
+        else if (e.phase === "writing") { showWriting(true, `Writing the ${e.queue_name || e.queue} alert`); startStream(e.queue); }
         else showWriting(false);
         if (e.clock) $("clock").textContent = e.clock;
-        if (e.partial) Object.entries(e.partial).forEach(([q, t]) => { if (t) { startStream(q, q); appendStream(q, t); } });
+        if (e.partial) Object.entries(e.partial).forEach(([q, t]) => { if (t) { partialText[q] = t; paintStream(q); } });
       } else if (e.kind === "clock") {
         $("clock").textContent = e.clock;
         $("story-state").textContent = `Running the clock, ${e.clock}`;
@@ -768,35 +777,36 @@
         refresh();
       } else if (e.kind === "positioned") {
         showWriting(false);
-        $("writing-live").hidden = true; $("writing-live").innerHTML = "";
+        clearStreams();
         refresh();
       }
     };
     es.onerror = () => { /* EventSource reconnects on its own */ };
   }
-  function closeStream() { if (es) { es.close(); es = null; } $("writing-live").hidden = true; $("writing-live").innerHTML = ""; }
+  function closeStream() { if (es) { es.close(); es = null; } clearStreams(); }
 
   const QUEUE_NAMES = { billing: "Billing Support", techsupport: "Technical Support" };
-  function startStream(queue, name) {
-    const box = $("writing-live");
-    if (box.querySelector(`[data-queue="${queue}"]`)) return;
-    box.hidden = false;
-    box.insertAdjacentHTML("beforeend", `<div class="stream-block thinking" data-queue="${queue}">
-      <h3><span class="pulse"></span>${esc(QUEUE_NAMES[queue] || name || queue)}</h3>
-      <div class="stream-text">reading the alert</div></div>`);
+  // Text streamed so far per queue. renderAlert reads it, so a card drawn by a
+  // board poll mid-write shows the words already received rather than a blank.
+  let partialText = {};
+  function startStream(queue) {
+    if (partialText[queue] === undefined) partialText[queue] = "";
+    paintStream(queue);
   }
   function appendStream(queue, text) {
-    const block = $("writing-live").querySelector(`[data-queue="${queue}"]`);
-    if (!block) { startStream(queue, queue); return appendStream(queue, text); }
-    const t = block.querySelector(".stream-text");
-    if (block.classList.contains("thinking")) { block.classList.remove("thinking"); t.textContent = ""; }
-    t.textContent += text;
+    if (partialText[queue] === undefined) partialText[queue] = "";
+    partialText[queue] += text;
+    paintStream(queue);
   }
-  function endStream(queue) {
-    const block = $("writing-live").querySelector(`[data-queue="${queue}"]`);
-    if (block) block.remove();
-    if (!$("writing-live").children.length) $("writing-live").hidden = true;
+  function paintStream(queue) {
+    const el = document.querySelector(`.narrative[data-queue="${queue}"]`);
+    if (!el) return;  // the next board poll will draw the card with the buffer
+    const text = partialText[queue] || "";
+    if (text) { el.classList.remove("waiting"); el.textContent = text; }
+    else { el.classList.add("waiting"); el.textContent = "reading the alert"; }
   }
+  function endStream(queue) { delete partialText[queue]; }
+  function clearStreams() { partialText = {}; }
 
   // --- live: run the clock forward to a minute, then the agent writes
   let jumping = false;
