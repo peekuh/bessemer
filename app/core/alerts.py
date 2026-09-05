@@ -665,7 +665,11 @@ def build_options(
         )
 
     if not any(o.recommended for o in options) and options:
-        options[0].recommended = True
+        # No staffing fix is available yet, typically because nobody from the
+        # early shift is in the building. The actionable move is then the one
+        # that goes after the cause, not the one that absorbs it.
+        preferred = next((o for o in options if o.pathway is Pathway.ESCALATE_TRANSPORT), None)
+        (preferred or options[0]).recommended = True
     return options
 
 
