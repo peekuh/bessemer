@@ -19,6 +19,8 @@ Run:  uv run uvicorn app.api:app --port 8000
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -41,6 +43,14 @@ from app.sessions import (
     drop_session,
     get_session,
 )
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("bessemer")
 
 
 @asynccontextmanager
@@ -108,10 +118,13 @@ async def _narrate_now(session: Session, force: bool = False) -> None:
             continue
         session.narrating = queue
         session.narrating_since = datetime.now()
+        started = time.perf_counter()
+        log.info("writing %s alert at %s (%s, %s%% coverage)", queue, session.replay.now.strftime("%H:%M"), alert.cause.value, alert.coverage_pct)
         try:
-            await agent_runner.compose(session, alert, fresh=True)
-        except Exception:  # noqa: BLE001 - the board outlives the model
-            pass
+            ok = await agent_runner.compose(session, alert, fresh=True)
+            log.info("%s %s alert in %.1fs", "wrote" if ok else "FAILED to write", queue, time.perf_counter() - started)
+        except Exception as exc:  # noqa: BLE001 - the board outlives the model
+            log.warning("FAILED to write %s alert: %s", queue, exc)
         finally:
             session.narrating = None
             session.narrating_since = None
@@ -171,6 +184,7 @@ async def start_replay(
     session.narrate = narrate
 
     if to:
+        log.info("jump to %s requested (clock at %s)", to, session.replay.now.strftime("%H:%M"))
         target = datetime.combine(scope.shift_date, datetime.strptime(to, "%H:%M").time())
         if target < session.replay.now:
             session = _restart(session)
@@ -181,6 +195,7 @@ async def start_replay(
         await _narrate_now(session, force=True)
         rec.capture(session)
         rec.save(session)
+        log.info("positioned at %s, recording saved", session.replay.now.strftime("%H:%M"))
         return {"status": "positioned", "clock": session.replay.now.isoformat()}
 
     if session.running:
@@ -226,6 +241,7 @@ async def reset_replay(
     fresh = scope.session()
     fresh.recording_stale = True
     fresh.narrate = True
+    log.info("reset to 07:30%s", ", recording forgotten" if forget_recording else "")
     return {"status": "reset", "alerts_cleared": removed, "clock": fresh.replay.now.isoformat()}
 
 

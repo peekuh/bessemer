@@ -349,9 +349,9 @@
         <span class="writing" id="writing" hidden><span class="pulse"></span><span id="writing-text">Writing</span></span>
       </div>
       <div class="track" id="track">
-        <input type="range" id="scrub" min="0" max="150" value="0" step="1" aria-label="Time of morning">
+        <input type="range" id="scrub" min="0" max="4" value="0" step="1" aria-label="Checkpoint">
         <div class="marks" id="marks"></div>
-        <div class="ticks"><span>07:30</span><span>08:00</span><span>08:30</span><span>09:00</span><span>09:30</span><span>10:00</span></div>
+        <div class="ticks" id="ticks"></div>
       </div>
       <div class="landmark">
         <span class="now" id="story-now">07:30</span>
@@ -676,8 +676,8 @@
   let landmarks = [];
   let cursor = "07:30";       // where the slider is
   let playbackTimer = null;
-  const minToHHMM = (m) => `${String(Math.floor((START_MIN + m) / 60)).padStart(2, "0")}:${String((START_MIN + m) % 60).padStart(2, "0")}`;
-  const hhmmToMin = (t) => (Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5))) - START_MIN;
+  const idxToHHMM = (i) => CHECKPOINTS[Math.max(0, Math.min(CHECKPOINTS.length - 1, i))].time;
+  const hhmmToIdx = (t) => { let i = 0; CHECKPOINTS.forEach((c, k) => { if (c.time <= t) i = k; }); return i; };
 
   function allMarks() {
     const seen = new Set(CHECKPOINTS.map((c) => c.time));
@@ -686,7 +686,7 @@
 
   function setCursor(hhmm) {
     cursor = hhmm;
-    $("scrub").value = hhmmToMin(hhmm);
+    $("scrub").value = hhmmToIdx(hhmm);
     $("story-now").textContent = hhmm;
     const here = allMarks().filter((m) => m.time <= hhmm).slice(-1)[0];
     $("story-what").innerHTML = here
@@ -695,10 +695,13 @@
   }
 
   function renderMarks() {
-    $("marks").innerHTML = allMarks().map((m) => {
-      const pct = (hhmmToMin(m.time) / 150) * 100;
-      return `<i class="${m.kind}" style="left:${pct}%" title="${esc(m.time)} ${esc(m.label)}"></i>`;
+    // Five stops, evenly spaced. Only these are clickable; the finer
+    // landmarks are named under the slider as you pass them.
+    $("marks").innerHTML = CHECKPOINTS.map((m, i) => {
+      const pct = (i / (CHECKPOINTS.length - 1)) * 100;
+      return `<i class="check" style="left:${pct}%" title="${esc(m.time)} ${esc(m.label)}" data-i="${i}"></i>`;
     }).join("");
+    $("ticks").innerHTML = CHECKPOINTS.map((m) => `<span>${m.time}</span>`).join("");
   }
 
   async function loadLandmarks() {
@@ -708,6 +711,7 @@
   // --- playback: read the recording, instant
   async function showRecorded(hhmm) {
     setCursor(hhmm);
+    showWriting(false);
     try {
       const snap = await get(`/at?t=${hhmm}`);
       renderBoard({ ...snap.board, running: false, narrating: null });
@@ -716,7 +720,9 @@
       renderFeed({ events: snap.events });
       $("story-state").textContent = "Playing back the last live run";
     } catch (e) {
-      $("story-state").textContent = "No recording yet. Switch to Live and run the morning, or click a checkpoint.";
+      $("story-state").textContent = e && String(e).includes("Failed to fetch")
+        ? "Server not reachable. Start it with: uv run uvicorn app.api:app --port 8000"
+        : "No recording yet. Switch to Live and click a checkpoint.";
     }
   }
 
@@ -770,10 +776,10 @@
     if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; $("play").textContent = "Play"; return; }
     $("play").textContent = "Pause";
     playbackTimer = setInterval(() => {
-      const next = hhmmToMin(cursor) + 1;
-      if (next > 150) { clearInterval(playbackTimer); playbackTimer = null; $("play").textContent = "Play"; return; }
-      showRecorded(minToHHMM(next));
-    }, 1000 / (speed / 60));
+      const next = hhmmToIdx(cursor) + 1;
+      if (next >= CHECKPOINTS.length) { clearInterval(playbackTimer); playbackTimer = null; $("play").textContent = "Play"; return; }
+      showRecorded(idxToHHMM(next));
+    }, 4000);
   }
 
   async function setLive(on) {
@@ -805,17 +811,10 @@
     if (live) { await setLive(true); return; }
     showRecorded("07:30");
   });
-  $("scrub").addEventListener("input", (ev) => { if (!live) showRecorded(minToHHMM(Number(ev.target.value))); else setCursor(minToHHMM(Number(ev.target.value))); });
-  $("scrub").addEventListener("change", (ev) => { if (live) jumpLive(minToHHMM(Number(ev.target.value))); });
+  $("scrub").addEventListener("input", (ev) => { if (!live) showRecorded(idxToHHMM(Number(ev.target.value))); else setCursor(idxToHHMM(Number(ev.target.value))); });
+  $("scrub").addEventListener("change", (ev) => { if (live) jumpLive(idxToHHMM(Number(ev.target.value))); });
   $("marks").style.pointerEvents = "auto";
-  $("marks").addEventListener("click", (ev) => { const i = ev.target.closest("i"); if (!i) return; goTo(i.title.slice(0, 5)); });
-  // Dots must be clickable, but the slider sits above them. Let clicks fall through
-  // to the marks layer where a dot is under the pointer.
-  $("scrub").addEventListener("pointerdown", (ev) => {
-    const rect = $("marks").getBoundingClientRect();
-    const hit = allMarks().find((m) => Math.abs(rect.left + (hhmmToMin(m.time) / 150) * rect.width - ev.clientX) < 9);
-    if (hit) { ev.preventDefault(); goTo(hit.time); }
-  });
+  $("marks").addEventListener("click", (ev) => { const i = ev.target.closest("i"); if (!i) return; goTo(idxToHHMM(Number(i.dataset.i))); });
   $("lm-prev").addEventListener("click", () => stepLandmark(-1));
   $("lm-next").addEventListener("click", () => stepLandmark(1));
   document.addEventListener("keydown", (ev) => {
@@ -833,14 +832,20 @@
   });
 
   // ------------------------------------------------------------ polling
+  let refreshSeq = 0;
   async function refresh() {
     if (!live) return;
+    const mine = ++refreshSeq;
     try {
       const [board, alerts, feed] = await Promise.all([
         get("/board"),
         get("/alerts"),
         get(`/events${lastEvent ? `?since=${encodeURIComponent(lastEvent)}` : ""}`),
       ]);
+      // A response that arrives after the mode changed, or after a newer poll,
+      // must not paint the screen. This is how "Writing the billing alert"
+      // outlived the toggle: a poll fired before the switch and landed after.
+      if (!live || mine !== refreshSeq) return;
       renderBoard(board);
       renderAlerts(alerts);
       renderFeed(feed);
@@ -855,8 +860,11 @@
         showWriting(false);
       }
     } catch (e) {
+      if (!live || mine !== refreshSeq) return;
+      showWriting(false);
+      $("story-state").textContent = "Server not reachable. Start it with: uv run uvicorn app.api:app --port 8000";
       $("headline").textContent = "Cannot reach the API";
-      $("subline").textContent = "Start it with: uv run uvicorn app.api:app --port 8000";
+      $("subline").textContent = "The board will recover on its own once the server is back.";
     }
   }
   // Boot: playback if a recording exists, otherwise live.
