@@ -259,7 +259,8 @@ async def reset_replay(
     fresh = scope.session()
     fresh.recording_stale = True
     fresh.narrate = True
-    log.info("reset to 07:30%s", ", recording forgotten" if forget_recording else "")
+    log.info("reset to 07:30, %d alert rows and their actions cleared%s", removed,
+             ", recording forgotten" if forget_recording else "")
     return {"status": "reset", "alerts_cleared": removed, "clock": fresh.replay.now.isoformat()}
 
 
@@ -398,16 +399,49 @@ async def at(t: str = Query(..., description="HH:MM"), scope: Scope = Depends())
     session = scope.session()
     recording = session.recording
     if recording is None or not recording.ready:
-        raise HTTPException(409, "no recording yet; switch to Live and run the morning")
+        raise HTTPException(409, "no recording yet; switch to Live and click a checkpoint")
     snap = recording.at(t)
-    taken = store.actions_for([a["id"] for a in snap["alerts"] if a.get("id")])
+    taken = store.actions_for_shift(scope.office, scope.shift_date, scope.shift_type)
     return {
         "clock": snap["clock"],
         "time": snap["time"],
         "board": snap["board"],
-        "alerts": [a | {"actions": _fmt_actions(taken.get(a.get("id") or -1, []), snap["clock"])} for a in snap["alerts"]],
+        "alerts": [a | {"actions": _fmt_actions(taken.get(a["queue"], []), snap["clock"])} for a in snap["alerts"]],
         "events": snap["events"],
     }
+
+
+def _alert_from_snapshot(frozen: dict[str, Any], scope: Scope) -> Alert:
+    """Rebuild an Alert from a recorded snapshot so playback can act on it
+    after the live session that produced it is gone."""
+    from app.core.alerts import Cause
+
+    alert = Alert(
+        queue=frozen["queue"],
+        display_name=frozen["queue_name"],
+        office=frozen["office"],
+        business_unit=frozen["business_unit"],
+        shift_date=scope.shift_date,
+        shift_type=frozen["shift_type"],
+        status=Status(frozen["status"]),
+        cause=Cause(frozen["cause"]),
+        opened_at=datetime.fromisoformat(frozen["opened_at"]),
+        updated_at=datetime.fromisoformat(frozen["updated_at"]),
+        coverage_pct=frozen.get("coverage_pct", 100),
+        riders_affected=frozen.get("riders_affected") or [],
+        impact=frozen.get("impact") or {},
+        hold_over=frozen.get("hold_over"),
+        triggers=frozen.get("triggers") or [],
+        narrative=frozen.get("narrative"),
+        drafts=frozen.get("drafts") or {},
+    )
+    alert.options = [
+        Option(pathway=Pathway(o["pathway"]), label=o["label"], rationale=o["rationale"],
+               people=o["people"], cost=o["cost"], recommended=o["recommended"],
+               urgent=o.get("urgent", False))
+        for o in frozen["options"]
+    ]
+    return alert
 
 
 # --------------------------------------------------------------------- acting
@@ -420,28 +454,25 @@ async def act(
     at: str | None = Query(None, description="HH:MM when acting from playback"),
     scope: Scope = Depends(),
 ) -> dict[str, Any]:
-    session = scope.session(create=False)
+    session = scope.session()
     session.persist()
-    found = session.alert_for(alert_id)
-    if found is None:
-        raise HTTPException(404, f"alert {alert_id} is not part of this shift")
-    _, alert = found
 
     when = session.replay.now
+    alert: Alert | None = None
     if at and session.recording and session.recording.ready:
+        # Playback: act on the alert as it stood at that minute, whether or
+        # not the live session still knows about it.
         snap = session.recording.at(at)
         frozen = next((a for a in snap["alerts"] if a.get("id") == alert_id), None) if snap else None
         if frozen:
             when = datetime.fromisoformat(snap["clock"])
-            alert.options = [
-                Option(pathway=Pathway(o["pathway"]), label=o["label"], rationale=o["rationale"],
-                       people=o["people"], cost=o["cost"], recommended=o["recommended"],
-                       urgent=o.get("urgent", False))
-                for o in frozen["options"]
-            ]
-            alert.drafts = frozen.get("drafts") or {}
-            alert.impact = frozen.get("impact") or alert.impact
-            alert.coverage_pct = frozen.get("coverage_pct", alert.coverage_pct)
+            alert = _alert_from_snapshot(frozen, scope)
+            alert_id = store.save_alert(alert)  # ensures a row exists to hang the action on
+    if alert is None:
+        found = session.alert_for(alert_id)
+        if found is None:
+            raise HTTPException(404, f"alert {alert_id} is not part of this shift")
+        _, alert = found
 
     try:
         chosen = Pathway(pathway)
@@ -459,6 +490,7 @@ async def act(
             record_cover(movers, scope.shift_date, minutes)
 
     action = store.record_action(alert_id, chosen.value, draft, option.people, when, option.cost)
+    log.info("action recorded: %s on %s at %s", chosen.value, alert.queue, when.strftime("%H:%M"))
     return {"status": "recorded", "pathway": chosen.value, "draft": draft,
             "people": option.people, "sent_at": action["sent_at"].isoformat()}
 

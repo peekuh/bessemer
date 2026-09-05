@@ -105,3 +105,33 @@ def test_the_story_beats_hold_on_the_designed_morning(client):
     a0930 = alerts_at("09:30")
     assert a0930["billing"]["status"] == "RESOLVED"
     assert a0930["techsupport"]["status"] != "RESOLVED"
+
+
+def test_start_over_clears_the_sent_log_but_keeps_the_recording(client):
+    """The Sent list must be empty after Start over, in either mode."""
+    jump(client, "09:30")
+    snap = client.get("/at", params={"t": "08:55"}).json()
+    billing = next(a for a in snap["alerts"] if a["queue"] == "billing")
+    client.post(f"/alerts/{billing['id']}/act", params={"pathway": "EARLY_SHIFT_COVER", "at": "08:55"})
+    assert sum(len(a["actions"]) for a in client.get("/at", params={"t": "09:00"}).json()["alerts"]) == 1
+
+    client.post("/replay/reset", params={"clear_cover": True})
+
+    after = client.get("/at", params={"t": "09:00"}).json()
+    assert after["time"] == "09:00", "the recording must survive a reset"
+    assert sum(len(a["actions"]) for a in after["alerts"]) == 0, "the sent log must not"
+
+
+def test_playback_clicks_still_record_after_a_reset(client):
+    """Playback alerts are tied to row ids from the live session that made
+    them. After a reset those rows are gone, and acting must still work."""
+    jump(client, "09:30")
+    client.post("/replay/reset", params={"clear_cover": True})
+    snap = client.get("/at", params={"t": "08:55"}).json()
+    billing = next(a for a in snap["alerts"] if a["queue"] == "billing")
+    done = client.post(f"/alerts/{billing['id']}/act",
+                       params={"pathway": "HOLD_OVER", "at": "08:55"}).json()
+    assert done["status"] == "recorded"
+    assert done["sent_at"].endswith("08:55:00")
+    again = client.get("/at", params={"t": "09:00"}).json()
+    assert sum(len(a["actions"]) for a in again["alerts"]) == 1

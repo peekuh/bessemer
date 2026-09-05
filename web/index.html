@@ -536,6 +536,9 @@
     // story is still visible after the queues recover.
     const show = open.length ? open : resolved.slice(0, 1);
     const panel = $("alert-panel");
+    // The Sent list is drawn from the same data and must be redrawn even when
+    // there is nothing else to show, or Start over leaves yesterday's log up.
+    renderSent(alerts);
     if (!show.length) {
       panel.innerHTML = `<div class="empty">No alert yet. The floor is on track.</div>`;
       return;
@@ -551,7 +554,6 @@
         `<div class="alert-block"><div class="alert-head"><h3 class="muted" style="font-weight:500">${esc(a.queue_name)}</h3><span class="when">resolved ${hhmm(a.resolved_at)}</span></div></div>`
       ).join(""));
     }
-    renderSent(alerts);
   }
 
   function renderAlert(show) {
@@ -881,6 +883,8 @@
   $("play").addEventListener("click", play);
   $("reset").addEventListener("click", async () => {
     if (live) { await setLive(true); return; }
+    // Playback: wipe the sent log and the cover counter, keep the recording.
+    await post(`/replay/reset?clear_cover=true`);
     showRecorded("07:30");
   });
   $("scrub").addEventListener("input", (ev) => { if (!live) showRecorded(idxToHHMM(Number(ev.target.value))); else setCursor(idxToHHMM(Number(ev.target.value))); });

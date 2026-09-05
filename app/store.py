@@ -200,6 +200,28 @@ def actions_for(alert_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
     return grouped
 
 
+def actions_for_shift(office: str, shift_date: date, shift_type: str) -> dict[str, list[dict[str, Any]]]:
+    """Every action taken on this shift, grouped by queue.
+
+    Keyed by queue rather than alert id because one alert exists per queue per
+    shift and the queue survives a reset or a restart, while the row id does
+    not. Playback merges actions by this key.
+    """
+    rows = query(
+        """
+        SELECT a.id, a.alert_id, s.queue, a.pathway, a.draft, a.candidates, a.sent_at, a.cost
+        FROM alert_actions a JOIN shift_alerts s ON s.id = a.alert_id
+        WHERE s.office = %s AND s.shift_date = %s AND s.shift_type = %s
+        ORDER BY a.sent_at
+        """,
+        (office, shift_date, shift_type),
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["queue"], []).append(row)
+    return grouped
+
+
 def reset_shift(office: str, shift_date: date, shift_type: str) -> int:
     """Clear one shift's alerts and actions so the demo can be run again.
 
