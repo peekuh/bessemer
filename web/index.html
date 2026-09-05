@@ -574,7 +574,7 @@
     } else if (show.narrative) {
       narrative = `<p class="narrative">${esc(show.narrative)}</p>`;
     } else if (partialText[show.queue] !== undefined) {
-      const text = partialText[show.queue];
+      const text = shownText(show.queue);
       narrative = text
         ? `<p class="narrative streaming" data-queue="${show.queue}">${esc(text)}</p>`
         : `<p class="narrative streaming waiting" data-queue="${show.queue}">reading the alert</p>`;
@@ -584,9 +584,14 @@
       narrative = `<p class="narrative pending">${esc(fallbackSummary(show))}</p>`;
     }
 
-    const context = (show.context || []).slice(0, 3).map((c) => `<li>${esc(c.text)}</li>`).join("");
+    // While the agent is writing this alert in live mode, hold back the
+    // benchmarks and the options. The header shows the alert has fired; the
+    // words arrive; then the options are offered. Shown all at once, a card
+    // reads as a pre-baked answer, which is exactly the wrong impression.
+    const writing = !resolved && !show.narrative && (partialText[show.queue] !== undefined || live);
+    const context = writing ? "" : (show.context || []).slice(0, 3).map((c) => `<li>${esc(c.text)}</li>`).join("");
 
-    const options = (show.options || []).filter((o) => o.pathway !== "WAIT" || resolved).map((o) => {
+    const options = writing ? "" : (show.options || []).filter((o) => o.pathway !== "WAIT" || resolved).map((o) => {
       const done = taken.has(o.pathway);
       const people = (o.people || []).map((p) => p.name || p.vendor || p.role).filter(Boolean).slice(0, 4).join(", ");
       const outcome = o.service_level ? `${o.service_level.service_level_pct}%` : "";
@@ -773,12 +778,13 @@
       } else if (e.kind === "token") {
         appendStream(e.queue, e.text);
       } else if (e.kind === "written") {
-        endStream(e.queue);
-        refresh();
+        if (partialText[e.queue] !== undefined) { finished[e.queue] = true; ensureTyper(); }
+        else refresh();
       } else if (e.kind === "positioned") {
         showWriting(false);
-        clearStreams();
-        refresh();
+        // Do not wipe a stream that is still typing out; it will reveal the
+        // final card itself when it catches up.
+        if (!Object.keys(partialText).length) refresh();
       }
     };
     es.onerror = () => { /* EventSource reconnects on its own */ };
@@ -788,25 +794,44 @@
   const QUEUE_NAMES = { billing: "Billing Support", techsupport: "Technical Support" };
   // Text streamed so far per queue. renderAlert reads it, so a card drawn by a
   // board poll mid-write shows the words already received rather than a blank.
-  let partialText = {};
+  let partialText = {};   // everything received so far, per queue
+  let shownChars = {};    // how much of it is on screen, per queue
+  let finished = {};      // the server has said "written"; finish the drain then reveal
+  let typer = null;
+  const CHARS_PER_TICK = 2, TICK_MS = 30;   // about 65 characters a second, reading pace
+
+  function shownText(queue) { return (partialText[queue] || "").slice(0, shownChars[queue] || 0); }
   function startStream(queue) {
-    if (partialText[queue] === undefined) partialText[queue] = "";
-    paintStream(queue);
+    if (partialText[queue] === undefined) { partialText[queue] = ""; shownChars[queue] = 0; }
+    paintStream(queue); ensureTyper();
   }
   function appendStream(queue, text) {
-    if (partialText[queue] === undefined) partialText[queue] = "";
+    if (partialText[queue] === undefined) { partialText[queue] = ""; shownChars[queue] = 0; }
     partialText[queue] += text;
-    paintStream(queue);
+    ensureTyper();
+  }
+  function ensureTyper() {
+    if (typer) return;
+    typer = setInterval(() => {
+      let busy = false;
+      for (const queue of Object.keys(partialText)) {
+        const total = partialText[queue].length, shown = shownChars[queue] || 0;
+        if (shown < total) { shownChars[queue] = Math.min(total, shown + CHARS_PER_TICK); paintStream(queue); busy = true; }
+        else if (finished[queue]) { delete finished[queue]; endStream(queue); refresh(); }
+        else busy = true;  // caught up, still waiting on more tokens
+      }
+      if (!busy) { clearInterval(typer); typer = null; }
+    }, TICK_MS);
   }
   function paintStream(queue) {
     const el = document.querySelector(`.narrative[data-queue="${queue}"]`);
     if (!el) return;  // the next board poll will draw the card with the buffer
-    const text = partialText[queue] || "";
+    const text = shownText(queue);
     if (text) { el.classList.remove("waiting"); el.textContent = text; }
     else { el.classList.add("waiting"); el.textContent = "reading the alert"; }
   }
-  function endStream(queue) { delete partialText[queue]; }
-  function clearStreams() { partialText = {}; }
+  function endStream(queue) { delete partialText[queue]; delete shownChars[queue]; }
+  function clearStreams() { partialText = {}; shownChars = {}; finished = {}; if (typer) { clearInterval(typer); typer = null; } }
 
   // --- live: run the clock forward to a minute, then the agent writes
   let jumping = false;
@@ -826,7 +851,7 @@
       jumping = false;
       $("track").classList.remove("disabled");
       document.querySelectorAll("#play, #reset, #lm-prev, #lm-next").forEach((b) => b.disabled = false);
-      await refresh();
+      if (!Object.keys(partialText).length) await refresh();
       renderMarks();
       $("story-state").textContent = "Live";
     }
