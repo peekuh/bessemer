@@ -174,7 +174,20 @@
   .landmark .what { font-weight: 500; }
   .landmark .what .dot { margin-right: 8px; }
   .landmark .nav { margin-left: auto; display: flex; gap: 6px; }
-  .story.hidden-strip { display: none; }
+  .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .switch .knob { width: 38px; height: 22px; border-radius: 11px; background: var(--rule); position: relative; transition: background .15s; }
+  .switch .knob::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 0 0 1px rgba(0,0,0,.08); }
+  .switch input:checked + .knob { background: var(--red); }
+  .switch input:checked + .knob::after { left: 19px; }
+  .switch input:focus-visible + .knob { outline: 2px solid var(--green); outline-offset: 2px; }
+  .switch-label { font-weight: 600; }
+  .story.is-live .switch-label { color: var(--red); }
+  .writing { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; color: var(--red); margin-left: auto; }
+  .writing .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--red); animation: pulse 1s infinite; }
+  .track.disabled { opacity: .45; pointer-events: none; }
+  .option.urgent { border-color: var(--red); }
+  .option.urgent .label { color: var(--red); }
 
   /* ------------------------------------------------------------ queues */
   .queues { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 26px; }
@@ -315,9 +328,6 @@
         <div class="sub" id="subline"></div>
       </div>
       <div class="controls">
-        <button class="btn" id="play">Run the morning</button>
-        <button class="btn quiet" id="jump">Jump to 08:55</button>
-        <button class="btn quiet" id="reset">Start over</button>
         <div class="speed" id="speed">
           <button data-s="30">30×</button>
           <button data-s="60" class="on">60×</button>
@@ -328,27 +338,25 @@
 
     <div class="story" id="story">
       <div class="row">
-        <span class="title">Tell the morning as a story</span>
-        <span class="state" id="story-state">Not prepared yet. This captures every minute from 07:30 to 10:00 and writes up each alert as it opens. About two minutes the first time.</span>
-        <div class="right">
-          <button class="btn quiet" id="story-rebuild" hidden title="Capture the morning again">Rebuild</button>
-          <button class="btn quiet" id="story-live" hidden>Back to live</button>
-          <button class="btn" id="story-prepare">Prepare the story</button>
-        </div>
+        <label class="switch" title="Live: compute and call the model for real. Off: play back the last live run.">
+          <input type="checkbox" id="live"><span class="knob"></span><span class="switch-label">Live</span>
+        </label>
+        <button class="btn primary" id="play">Play</button>
+        <button class="btn quiet" id="reset">Start over</button>
+        <span class="state" id="story-state"></span>
+        <span class="writing" id="writing" hidden><span class="pulse"></span><span id="writing-text">Writing</span></span>
       </div>
-      <div id="story-controls" hidden>
-        <div class="track">
-          <input type="range" id="scrub" min="0" max="150" value="0" step="1" aria-label="Time of morning">
-          <div class="marks" id="marks"></div>
-          <div class="ticks"><span>07:30</span><span>08:00</span><span>08:30</span><span>09:00</span><span>09:30</span><span>10:00</span></div>
-        </div>
-        <div class="landmark">
-          <span class="now" id="story-now">07:30</span>
-          <span class="what" id="story-what"></span>
-          <div class="nav">
-            <button class="btn" id="lm-prev" title="Previous landmark (←)">Previous</button>
-            <button class="btn" id="lm-next" title="Next landmark (→)">Next</button>
-          </div>
+      <div class="track" id="track">
+        <input type="range" id="scrub" min="0" max="150" value="0" step="1" aria-label="Time of morning">
+        <div class="marks" id="marks"></div>
+        <div class="ticks"><span>07:30</span><span>08:00</span><span>08:30</span><span>09:00</span><span>09:30</span><span>10:00</span></div>
+      </div>
+      <div class="landmark">
+        <span class="now" id="story-now">07:30</span>
+        <span class="what" id="story-what"><span class="muted">Drag the slider or click a dot</span></span>
+        <div class="nav">
+          <button class="btn" id="lm-prev" title="Previous landmark (←)">Previous</button>
+          <button class="btn" id="lm-next" title="Next landmark (→)">Next</button>
         </div>
       </div>
     </div>
@@ -436,7 +444,6 @@
     running = b.running;
     $("clock").textContent = b.time;
     $("site").innerHTML = `<strong>${esc(b.office)}</strong> &nbsp; ${esc(b.shift_type)} shift, ${esc(b.shift_date)}`;
-    $("play").textContent = running ? "Pause" : (b.time === "07:30" ? "Run the morning" : "Resume");
 
     const t = b.totals;
     const cls = t.coverage_pct >= 90 ? "" : t.coverage_pct >= 75 ? "warn" : "bad";
@@ -561,7 +568,7 @@
       // The rationale already spells out the hold-over; only the price is new here.
       const cost = o.cost && o.cost.agents_held ? `Overtime about ${o.cost.cost}` : "";
       const sentAt = done ? (show.actions.find((a) => a.pathway === o.pathway) || {}).time : "";
-      return `<button class="option ${o.recommended ? "recommended" : ""}" data-alert="${show.id}" data-pathway="${o.pathway}" ${done || resolved ? "disabled" : ""}>
+      return `<button class="option ${o.recommended ? "recommended" : ""} ${o.urgent ? "urgent" : ""}" data-alert="${show.id}" data-pathway="${o.pathway}" ${done || resolved ? "disabled" : ""}>
         <span class="label">${esc(PATHWAY[o.pathway] || o.label)}</span>
         ${outcome ? `<span class="outcome">${outcome}</span>` : ""}
         <span class="why">${esc(o.rationale)}</span>
@@ -652,26 +659,23 @@
     refresh();
   });
 
-  // ------------------------------------------------------------- story
+  // -------------------------------------------------------- live / playback
   const START_MIN = 7 * 60 + 30;
-  let story = false;
+  let live = false;
   let landmarks = [];
-  let storyTime = "07:30";
+  let cursor = "07:30";       // where the slider is
+  let playbackTimer = null;
   const minToHHMM = (m) => `${String(Math.floor((START_MIN + m) / 60)).padStart(2, "0")}:${String((START_MIN + m) % 60).padStart(2, "0")}`;
   const hhmmToMin = (t) => (Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5))) - START_MIN;
 
-  function setStoryMode(on) {
-    story = on;
-    document.getElementById("story-controls").hidden = !on;
-    document.getElementById("story-live").hidden = !on;
-    document.getElementById("story-prepare").hidden = on;
-    if (on) {
-      document.querySelector(".story .title").innerHTML = `Story <span class="badge">scrubbing</span>`;
-      $("story-state").textContent = "Drag the slider, click a dot, or use the arrow keys.";
-    } else {
-      document.querySelector(".story .title").textContent = "Tell the morning as a story";
-      refresh();
-    }
+  function setCursor(hhmm) {
+    cursor = hhmm;
+    $("scrub").value = hhmmToMin(hhmm);
+    $("story-now").textContent = hhmm;
+    const here = landmarks.filter((m) => m.time <= hhmm).slice(-1)[0];
+    $("story-what").innerHTML = here
+      ? `<span class="dot ${here.kind === "mark" ? "" : here.kind}"></span>${esc(here.label)}${here.time !== hhmm ? ` <span class="muted">at ${here.time}</span>` : ""}`
+      : `<span class="muted">Before anything happened</span>`;
   }
 
   function renderMarks() {
@@ -681,109 +685,106 @@
     }).join("");
   }
 
-  async function showStoryAt(hhmm) {
-    storyTime = hhmm;
-    $("scrub").value = hhmmToMin(hhmm);
-    $("story-now").textContent = hhmm;
-    const here = landmarks.filter((m) => m.time <= hhmm).slice(-1)[0];
-    $("story-what").innerHTML = here
-      ? `<span class="dot ${here.kind === "mark" ? "" : here.kind}"></span>${esc(here.label)}${here.time !== hhmm ? ` <span class="muted">at ${here.time}</span>` : ""}`
-      : `<span class="muted">Before anything happened</span>`;
+  async function loadLandmarks() {
+    try { const r = await get(`/landmarks`); landmarks = r.landmarks || []; renderMarks(); } catch (e) {}
+  }
+
+  // --- playback: read the recording, instant
+  async function showRecorded(hhmm) {
+    setCursor(hhmm);
     try {
-      const snap = await get(`/timeline?at=${hhmm}`);
-      renderBoard({ ...snap.board, running: false });
+      const snap = await get(`/at?t=${hhmm}`);
+      renderBoard({ ...snap.board, running: false, narrating: null });
       renderAlerts({ alerts: snap.alerts });
       events.length = 0; lastEvent = null;
       renderFeed({ events: snap.events });
-      $("play").textContent = "Run the morning";
+      $("story-state").textContent = "Playing back the last live run";
     } catch (e) {
-      $("story-what").textContent = "Could not load that minute";
+      $("story-state").textContent = "No recording yet. Switch to Live and run the morning, or click a checkpoint.";
     }
+  }
+
+  // --- live: run the clock forward to a minute, then the agent writes
+  async function jumpLive(hhmm) {
+    setCursor(hhmm);
+    $("story-state").textContent = `Running to ${hhmm}`;
+    $("track").classList.add("disabled");
+    showWriting(true, "Computing the floor, then writing");
+    try {
+      await post(`/replay/start?to=${hhmm}&speed=${speed}`);
+    } finally {
+      $("track").classList.remove("disabled");
+      showWriting(false);
+      await refresh(); await loadLandmarks();
+      $("story-state").textContent = "Live";
+    }
+  }
+
+  function showWriting(on, text) {
+    $("writing").hidden = !on;
+    if (text) $("writing-text").textContent = text;
   }
 
   function stepLandmark(dir) {
     if (!landmarks.length) return;
     const next = dir > 0
-      ? landmarks.find((m) => m.time > storyTime)
-      : landmarks.slice().reverse().find((m) => m.time < storyTime);
-    if (next) showStoryAt(next.time);
+      ? landmarks.find((m) => m.time > cursor)
+      : landmarks.slice().reverse().find((m) => m.time < cursor);
+    if (next) goTo(next.time);
   }
 
-  async function prepareStory() {
-    const btn = $("story-prepare"), state = $("story-state");
-    btn.disabled = true;
-    state.textContent = "Starting";
-    await post(`/timeline/build?narrate=true`);
-    const poll = setInterval(async () => {
-      const st = await get(`/timeline/status`);
-      if (st.error) { clearInterval(poll); state.textContent = `Failed: ${st.error}`; btn.disabled = false; return; }
-      if (st.building) {
-        state.textContent = `Capturing ${minToHHMM(Math.min(150, st.ticks_done))} of 10:00, ${st.narrated} alert${st.narrated === 1 ? "" : "s"} written up`;
-        return;
-      }
-      if (st.ready) {
-        clearInterval(poll);
-        landmarks = st.landmarks;
-        renderMarks();
-        state.textContent = `${landmarks.length} landmarks. Drag the slider or use the arrow keys.`;
-        btn.disabled = false;
-        btn.textContent = "Open the story";
-        timelineReady = true;
-        $("story-rebuild").hidden = false;
-        setStoryMode(true);
-        showStoryAt("07:30");
-      }
-    }, 1000);
+  function goTo(hhmm) { return live ? jumpLive(hhmm) : showRecorded(hhmm); }
+
+  // --- play / pause in each mode
+  async function play() {
+    if (live) {
+      if (running) { await post(`/replay/pause`); } else { await post(`/replay/start?speed=${speed}`); }
+      refresh();
+      return;
+    }
+    if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; $("play").textContent = "Play"; return; }
+    $("play").textContent = "Pause";
+    playbackTimer = setInterval(() => {
+      const next = hhmmToMin(cursor) + 1;
+      if (next > 150) { clearInterval(playbackTimer); playbackTimer = null; $("play").textContent = "Play"; return; }
+      showRecorded(minToHHMM(next));
+    }, 1000 / (speed / 60));
   }
 
-  // One handler, one decision. A first version attached a build handler with
-  // addEventListener and then, once a timeline turned out to exist, assigned
-  // an "open" handler to onclick as well. Both fired: opening the story also
-  // rebuilt it, which dropped the ready timeline and cancelled the narrator
-  // mid-sentence.
-  let timelineReady = false;
-  $("story-prepare").addEventListener("click", () => {
-    if (timelineReady) { setStoryMode(true); showStoryAt("07:30"); }
-    else prepareStory();
+  function setLive(on) {
+    live = on;
+    $("live").checked = on;
+    $("story").classList.toggle("is-live", on);
+    if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; }
+    $("play").textContent = "Play";
+    if (on) {
+      $("story-state").textContent = "Live. Click a dot to run there and watch the agent write.";
+      refresh();
+    } else {
+      showRecorded(cursor);
+    }
+    loadLandmarks();
+  }
+
+  $("live").addEventListener("change", (ev) => setLive(ev.target.checked));
+  $("play").addEventListener("click", play);
+  $("reset").addEventListener("click", async () => {
+    if (live) { await post(`/replay/reset?clear_cover=true`); events.length = 0; lastEvent = null; refresh(); }
+    goTo("07:30");
   });
-  $("story-rebuild").addEventListener("click", () => {
-    if (confirm("Capture the morning again? Cached write-ups make this quick.")) prepareStory();
-  });
-  $("story-live").addEventListener("click", () => setStoryMode(false));
-  $("scrub").addEventListener("input", (ev) => showStoryAt(minToHHMM(Number(ev.target.value))));
+  $("scrub").addEventListener("input", (ev) => { if (!live) showRecorded(minToHHMM(Number(ev.target.value))); else setCursor(minToHHMM(Number(ev.target.value))); });
+  $("scrub").addEventListener("change", (ev) => { if (live) jumpLive(minToHHMM(Number(ev.target.value))); });
+  $("marks").style.pointerEvents = "auto";
+  $("marks").addEventListener("click", (ev) => { const i = ev.target.closest("i"); if (!i) return; goTo(i.title.slice(0, 5)); });
   $("lm-prev").addEventListener("click", () => stepLandmark(-1));
   $("lm-next").addEventListener("click", () => stepLandmark(1));
   document.addEventListener("keydown", (ev) => {
-    if (!story || ev.target.tagName === "INPUT") return;
+    // Only stand aside for fields where arrows mean something else: the chat
+    // box and the slider itself. The Live switch keeps focus after a click,
+    // and ignoring every input made the arrow keys go dead in live mode.
+    if (ev.target.matches("input[type=text], input[type=range], textarea")) return;
     if (ev.key === "ArrowRight") { ev.preventDefault(); stepLandmark(1); }
     if (ev.key === "ArrowLeft") { ev.preventDefault(); stepLandmark(-1); }
-  });
-
-  // If a timeline already exists on the server, offer it straight away.
-  get(`/timeline/status`).then((st) => {
-    if (st.ready) {
-      landmarks = st.landmarks; renderMarks();
-      timelineReady = true;
-      $("story-state").textContent = `${landmarks.length} landmarks ready from an earlier build.`;
-      $("story-prepare").textContent = "Open the story";
-      $("story-rebuild").hidden = false;
-    }
-  }).catch(() => {});
-
-  // ---------------------------------------------------------- controls
-  $("play").addEventListener("click", async () => {
-    if (running) {
-      await post(`/replay/pause`);
-    } else {
-      await post(`/replay/start?speed=${speed}`);
-    }
-    refresh();
-  });
-  $("jump").addEventListener("click", async () => { await post(`/replay/start?to=08:55`); refresh(); });
-  $("reset").addEventListener("click", async () => {
-    await post(`/replay/reset?clear_cover=true`);
-    events.length = 0; lastEvent = null;
-    refresh();
   });
   $("speed").addEventListener("click", (ev) => {
     const b = ev.target.closest("button"); if (!b) return;
@@ -793,6 +794,7 @@
 
   // ------------------------------------------------------------ polling
   async function refresh() {
+    if (!live) return;
     try {
       const [board, alerts, feed] = await Promise.all([
         get("/board"),
@@ -802,14 +804,22 @@
       renderBoard(board);
       renderAlerts(alerts);
       renderFeed(feed);
+      setCursor(board.time);
+      $("play").textContent = board.running ? "Pause" : "Play";
+      showWriting(!!board.narrating, board.narrating ? `Writing the ${board.narrating} alert` : "");
+      if (board.narrating) $("story-state").textContent = "Live. The clock is paused while the agent writes.";
     } catch (e) {
       $("headline").textContent = "Cannot reach the API";
       $("subline").textContent = "Start it with: uv run uvicorn app.api:app --port 8000";
     }
   }
-  refresh();
-  setInterval(() => { if (running && !story) refresh(); }, 1000);
-  setInterval(() => { if (!running && !story) refresh(); }, 6000);
+  // Boot: playback if a recording exists, otherwise live.
+  get("/board").then((b) => {
+    landmarks = []; loadLandmarks();
+    if (b.recording && b.recording.ready) { setLive(false); } else { setLive(true); }
+  }).catch(() => setLive(true));
+  setInterval(() => { if (live && running) refresh(); }, 1000);
+  setInterval(() => { if (live && !running) refresh(); }, 5000);
 })();
 </script>
 </body>

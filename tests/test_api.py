@@ -33,7 +33,7 @@ def client():
 
 
 def at(client: TestClient, hhmm: str):
-    return client.post("/replay/start", params={"to": hhmm})
+    return client.post("/replay/start", params={"to": hhmm, "narrate": False})
 
 
 # ------------------------------------------------------------------- control
@@ -135,9 +135,10 @@ def test_events_feed_is_ordered_and_filterable(client):
     events = client.get("/events").json()["events"]
     assert events
     assert [e["at"] for e in events] == sorted(e["at"] for e in events)
-    later = client.get("/events", params={"since": "2026-06-11T09:00:00"}).json()["events"]
+    cutoff = f"{DEMO_DATE}T09:00:00"
+    later = client.get("/events", params={"since": cutoff}).json()["events"]
     assert 0 < len(later) < len(events)
-    assert all(e["at"] > "2026-06-11T09:00:00" for e in later)
+    assert all(e["at"] > cutoff for e in later)
 
 
 # --------------------------------------------------------------------- acting
@@ -249,7 +250,7 @@ def test_pause_holds_the_clock_and_resume_continues_from_it(client):
     the clock kept running. A replay a presenter cannot stop is not a demo."""
     import time
 
-    client.post("/replay/start", params={"speed": 600})
+    client.post("/replay/start", params={"speed": 600, "narrate": False})
     time.sleep(0.5)
     paused = client.post("/replay/pause").json()
     assert paused["status"] == "paused"
@@ -261,7 +262,7 @@ def test_pause_holds_the_clock_and_resume_continues_from_it(client):
     assert board["clock"] == held_at, "the clock must not move while paused"
     assert board["running"] is False
 
-    resumed = client.post("/replay/start", params={"speed": 600}).json()
+    resumed = client.post("/replay/start", params={"speed": 600, "narrate": False}).json()
     assert resumed["status"] == "running"
     assert resumed["clock"] == held_at, "resume must continue from the paused tick"
     client.post("/replay/pause")

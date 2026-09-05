@@ -227,7 +227,9 @@ async def _invoke(
     return "\n".join(reply).strip()
 
 
-async def compose(session: Session, alert: Alert, user_id: str = "line_manager") -> bool:
+async def compose(
+    session: Session, alert: Alert, user_id: str = "line_manager", fresh: bool = False
+) -> bool:
     """Write up one alert, unless the same situation has been written before.
 
     Returns True if the alert now carries prose, whether newly written or
@@ -239,7 +241,7 @@ async def compose(session: Session, alert: Alert, user_id: str = "line_manager")
         alert_id = store.save_alert(alert)
         session.alert_ids[alert.queue] = alert_id
 
-    cached = store.find_cached_narrative(alert.payload_hash())
+    cached = None if fresh else store.find_cached_narrative(alert.payload_hash())
     if cached and cached.get("narrative"):
         alert.narrative = cached["narrative"]
         alert.drafts = cached.get("drafts") or {}

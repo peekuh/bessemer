@@ -38,8 +38,12 @@ class Session:
     started_clock: datetime | None = None
     alert_ids: dict[str, int] = field(default_factory=dict)
     task: asyncio.Task | None = None
-    timeline: Any = None
-    """A `Timeline` once the morning has been captured for scrubbing."""
+    recording: Any = None
+    """The last live run, for playback. See app.recording."""
+    narrating: str | None = None
+    """Queue whose alert the agent is writing right now, for the UI."""
+    narrate: bool = True
+    """Whether live runs call the model. Tests turn this off."""
 
     @property
     def key(self) -> str:
@@ -101,6 +105,8 @@ def get_session(
             )
         session = Session(replay=replay)
         SESSIONS[key] = session
+        from app import recording as rec
+        rec.load(session)
     return session
 
 

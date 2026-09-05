@@ -164,6 +164,17 @@ CREATE TABLE IF NOT EXISTS narrative_cache (
     written_at   timestamp NOT NULL DEFAULT now()
 );
 
+-- The last live run, tick by tick, for playback. One row per shift.
+CREATE TABLE IF NOT EXISTS recordings (
+    key           text PRIMARY KEY,
+    business_unit text NOT NULL,
+    office        text NOT NULL,
+    shift_date    date NOT NULL,
+    shift_type    text NOT NULL,
+    saved_at      timestamp NOT NULL DEFAULT now(),
+    payload       jsonb NOT NULL
+);
+
 -- Synthetic fairness counter: how many cover minutes each rider has absorbed
 -- this ISO week. Starts empty; incremented when the manager acts on an alert.
 CREATE TABLE IF NOT EXISTS cover_log (

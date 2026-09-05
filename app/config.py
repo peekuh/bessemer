@@ -45,7 +45,8 @@ BUSINESS_UNIT = os.getenv("BESSEMER_BU", "pinnacle-Slc")
 OFFICE = os.getenv("BESSEMER_OFFICE", "Clearwater Campus")
 SHIFT_TYPE = os.getenv("BESSEMER_SHIFT", "09:00")
 COVER_SHIFT_TYPE = os.getenv("BESSEMER_COVER_SHIFT", "08:30")
-DEMO_DATE = os.getenv("BESSEMER_DEMO_DATE", "2026-06-11")
+DEMO_DATE = os.getenv("BESSEMER_DEMO_DATE", "2026-08-06")
+"""The designed morning from db/seed_story.py. Set to 2026-06-11 for the real one."""
 
 # --- the operating model ----------------------------------------------------
 #

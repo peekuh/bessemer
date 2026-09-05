@@ -101,13 +101,17 @@ def test_nobody_covers_for_themselves():
 
 @pytest.mark.parametrize("role,expected", [("primary", 24), ("cover", 22)])
 def test_roster_day_gives_one_leg_per_rider(role, expected):
-    """Two cover riders take a second inbound leg; the view must pick one."""
+    """Two cover riders take a second inbound leg; the view must pick one.
+
+    Pinned to the real 11 June, because that is where the two second legs
+    live. The designed story day has none by construction.
+    """
     row = query_one(
         """
         SELECT count(*) AS rows, count(DISTINCT stwid) AS riders
         FROM v_roster_day WHERE trip_date = %s AND role = %s
         """,
-        (DEMO_DATE, role),
+        ("2026-06-11", role),
     )
     assert row["rows"] == row["riders"] == expected
 

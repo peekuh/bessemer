@@ -1,40 +1,37 @@
 """HTTP surface for the shift board.
 
-Thin by design. Every endpoint either reads the reasoning core or records a
-decision; none of them contain judgement of their own. If a number appears here
-that is not computed upstream, that is a bug.
+Thin by design: every endpoint either reads the reasoning core or records a
+decision. Two modes, one switch.
 
-Two design notes worth stating.
+**Live.** The clock is real. Each tick is computed, and when an alert's
+situation changes the model is called fresh, with the clock paused while it
+writes so the audience sees generation happen. Every tick is captured into a
+recording as it goes.
 
-**The replay is a session, not a request.** A board that recomputed the whole
-morning on each poll would be both slow and wrong: alert lifecycle depends on
-what was true a tick ago, so the clock has to live somewhere. It lives in a
-process-local session keyed by tenant, office and shift.
+**Playback.** `/at?t=` reads the last recording. No compute, no model.
 
-**Every endpoint is scoped by business unit and office.** Not because this
-prototype serves more than one, but because a multi-tenancy claim that is not
-enforced at the API is not a claim, it is a hope. Defaults come from config so
-the demo needs no arguments.
+Every endpoint is scoped by business unit, office, date and shift through one
+dependency, so no endpoint can quietly forget the tenant boundary.
 
-Run:  uv run uvicorn app.api:app --reload
+Run:  uv run uvicorn app.api:app --port 8000
 """
 
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from app import recording as rec
+from app import store
 from app.config import BUSINESS_UNIT, DEMO_DATE, OFFICE, SHIFT_TYPE
-from app.core.alerts import Alert, Pathway, Status
+from app.core.alerts import Alert, Option, Pathway, Status
 from app.core.remediation import record_cover
 from app.sessions import (
     SESSIONS,
@@ -43,9 +40,7 @@ from app.sessions import (
     SessionMissing,
     drop_session,
     get_session,
-    session_key,
 )
-from app import store
 
 
 @asynccontextmanager
@@ -59,39 +54,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shift Readiness Agent",
     description="Commute delays, translated into floor readiness for a line manager.",
-    version="0.3.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
-
-# The board is served from a separate dev server during development.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # --------------------------------------------------------------- tenant scope
 
 
 class Scope:
-    """The tenant, site and shift every request is answered within.
-
-    A FastAPI dependency rather than four repeated parameters, so there is one
-    place where the scoping rule lives and no endpoint can quietly forget it.
-    Defaults come from config, which is what lets the demo be argument-free
-    without making the isolation optional.
-    """
+    """Tenant, site and shift for every request. Defaults from config."""
 
     def __init__(
         self,
-        business_unit: str = Query(BUSINESS_UNIT, description="Client account"),
-        office: str = Query(OFFICE, description="Site"),
-        shift_date: date = Query(
-            default_factory=lambda: date.fromisoformat(DEMO_DATE), description="Shift date"
-        ),
-        shift_type: str = Query(SHIFT_TYPE, description="Shift start, HH:MM"),
+        business_unit: str = Query(BUSINESS_UNIT),
+        office: str = Query(OFFICE),
+        shift_date: date = Query(default_factory=lambda: date.fromisoformat(DEMO_DATE)),
+        shift_type: str = Query(SHIFT_TYPE),
     ) -> None:
         self.business_unit = business_unit
         self.office = office
@@ -99,161 +79,111 @@ class Scope:
         self.shift_type = shift_type
 
     def session(self, create: bool = True) -> Session:
-        """The running replay for this scope, as an HTTP-shaped error if absent."""
         try:
             return get_session(
                 self.business_unit, self.office, self.shift_date, self.shift_type, create
             )
-        except RosterMissing as exc:
-            raise HTTPException(404, str(exc)) from exc
-        except SessionMissing as exc:
+        except (RosterMissing, SessionMissing) as exc:
             raise HTTPException(404, str(exc)) from exc
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "business_unit": self.business_unit,
-            "office": self.office,
-            "shift_date": self.shift_date.isoformat(),
-            "shift_type": self.shift_type,
-        }
+
+# ----------------------------------------------------------------- narration
 
 
-# ------------------------------------------------------------------- control
+async def _narrate_now(session: Session, force: bool = False) -> None:
+    """Write up alerts, blocking the clock while the model works.
 
-
-@app.post("/replay/start", tags=["replay"])
-async def start_replay(
-    speed: float = Query(60.0, gt=0, le=3600, description="Replay minutes per real second"),
-    to: str | None = Query(None, description="Jump straight to HH:MM instead of running"),
-    scope: Scope = Depends(),
-) -> dict[str, Any]:
-    """Start the clock, or jump it to a given time.
-
-    `to` exists for the demo and for tests: a presenter who wants to open on
-    the worst moment should not have to wait two minutes for the clock to get
-    there.
+    Live mode always calls the model fresh; the memo is for nothing here.
+    `force` rewrites every open alert regardless of whether its situation
+    changed, which is what a presenter clicking a checkpoint wants to see.
     """
-    session = scope.session()
-    session.speed = speed
+    from agent import runner as agent_runner
 
-    if to:
-        target = datetime.combine(scope.shift_date, datetime.strptime(to, "%H:%M").time())
-        if target < session.replay.now:
-            # The clock only moves forward, so rewinding means starting over.
-            session = _recreate(session)
-        for tick in session.replay.ticks():
-            if tick <= session.replay.now:
-                continue
-            if tick > target:
-                break
-            session.replay.advance(tick)
+    if not session.narrate:
+        return
+    for queue, alert in list(session.replay.alerts.items()):
+        if alert.status is Status.RESOLVED:
+            continue
+        if not force and not alert.needs_narrative(session.replay.now):
+            continue
+        session.narrating = queue
+        try:
+            await agent_runner.compose(session, alert, fresh=True)
+        except Exception:  # noqa: BLE001 - the board outlives the model
+            pass
+        finally:
+            session.narrating = None
         session.persist()
-        # A jump lands on a situation worth explaining as often as the clock
-        # does. Without this, "Jump to 08:55" showed the grey fallback until
-        # somebody pressed Resume.
-        await _narrate_pending(session)
-        return {"status": "positioned", "clock": session.replay.now.isoformat()}
-
-    if session.running:
-        return {"status": "already running", "clock": session.replay.now.isoformat()}
-
-    session.running = True
-    session.started_wall = datetime.now()
-    session.started_clock = session.replay.now
-    session.task = asyncio.create_task(_run(session))
-    return {"status": "running", "speed": speed, "clock": session.replay.now.isoformat()}
 
 
 async def _run(session: Session) -> None:
-    """Advance the clock in the background, narrating what deserves it."""
+    """Advance the clock at the session's speed, narrating and capturing."""
     try:
         for tick in session.replay.ticks():
             if tick <= session.replay.now:
                 continue
             session.replay.advance(tick)
             session.persist()
-            await _narrate_pending(session)
+            await _narrate_now(session)
+            rec.capture(session)
             await asyncio.sleep(session.replay.tick_minutes / session.speed)
     except asyncio.CancelledError:
         pass
     finally:
         session.running = False
+        rec.save(session)
 
 
-_narrating: set[str] = set()
-
-
-async def _narrate_pending(session: Session) -> None:
-    """Ask the agent to write up any alert whose situation has changed.
-
-    The decision about *whether* to write is made upstream in `Alert`, which
-    tracks what it last said and refuses to repeat itself. This only acts on
-    that decision.
-
-    Each write-up runs as its own task rather than inline, because a model call
-    takes around nine seconds and the clock must not stop for it. Inline, a
-    replay at 60x froze visibly every time an alert changed, which on a bad
-    morning is a dozen freezes. Detached, the board keeps moving and the prose
-    lands when it lands; the structured payload is on screen in the meantime.
-
-    A per-alert guard stops a second task starting while the first is still
-    writing, which would otherwise happen on the very next tick.
-    """
-    from agent import runner as agent_runner
-
-    for alert in list(session.replay.alerts.values()):
-        if not alert.needs_narrative(session.replay.now):
+def _advance_to(session: Session, target: datetime) -> None:
+    for tick in session.replay.ticks():
+        if tick <= session.replay.now:
             continue
-        key = f"{session.key}|{alert.queue}"
-        if key in _narrating:
-            continue
-        _narrating.add(key)
-
-        async def write(alert=alert, key=key) -> None:
-            try:
-                await agent_runner.compose(session, alert)
-            except Exception:  # noqa: BLE001 - the board must outlive the model
-                pass
-            finally:
-                _narrating.discard(key)
-                session.persist()
-
-        asyncio.create_task(write())
+        if tick > target:
+            break
+        session.replay.advance(tick)
+        # Persist before capturing so every snapshot carries the alert's row
+        # id. Without it, alerts opened mid-jump were recorded with id None
+        # and could not be acted on from playback.
+        session.persist()
+        rec.capture(session)
 
 
-def _recreate(session: Session) -> Session:
-    """Start the morning over.
-
-    The replay clock only moves forward, by design: every read is guarded
-    against `now` so nothing can leak in before it happened. Rewinding
-    therefore means building a fresh replay rather than winding the existing
-    one back, which would leave rider states and alert history from a future
-    the new clock has not reached.
-    """
-    drop_session(
-        session.replay.business_unit,
-        session.replay.office,
-        session.replay.shift_date,
-        session.replay.shift_type,
-    )
-    fresh = get_session(
-        session.replay.business_unit,
-        session.replay.office,
-        session.replay.shift_date,
-        session.replay.shift_type,
-    )
-    fresh.speed = session.speed
-    return fresh
+# ------------------------------------------------------------------- control
 
 
-@app.post("/replay/pause", tags=["replay"])
+@app.post("/replay/start", tags=["live"])
+async def start_replay(
+    speed: float = Query(60.0, gt=0, le=3600),
+    to: str | None = Query(None, description="Jump to HH:MM, then write up what is open"),
+    narrate: bool = Query(True, description="Call the model. Tests pass false."),
+    scope: Scope = Depends(),
+) -> dict[str, Any]:
+    session = scope.session()
+    session.speed = speed
+    session.narrate = narrate
+
+    if to:
+        target = datetime.combine(scope.shift_date, datetime.strptime(to, "%H:%M").time())
+        if target < session.replay.now:
+            session = _restart(session)
+        if session.task and not session.task.done():
+            session.task.cancel()
+            session.running = False
+        _advance_to(session, target)
+        await _narrate_now(session, force=True)
+        rec.capture(session)
+        rec.save(session)
+        return {"status": "positioned", "clock": session.replay.now.isoformat()}
+
+    if session.running:
+        return {"status": "already running", "clock": session.replay.now.isoformat()}
+    session.running = True
+    session.task = asyncio.create_task(_run(session))
+    return {"status": "running", "speed": speed, "clock": session.replay.now.isoformat()}
+
+
+@app.post("/replay/pause", tags=["live"])
 async def pause_replay(scope: Scope = Depends()) -> dict[str, Any]:
-    """Stop the clock where it is. Resume with /replay/start.
-
-    The session and everything it holds survive; only the background task is
-    cancelled. Starting again picks up from the same tick, because `_run`
-    skips every tick at or before the current clock.
-    """
     session = scope.session(create=False)
     if session.task and not session.task.done():
         session.task.cancel()
@@ -263,53 +193,51 @@ async def pause_replay(scope: Scope = Depends()) -> dict[str, Any]:
             pass
     session.running = False
     session.task = None
+    rec.save(session)
     return {"status": "paused", "clock": session.replay.now.isoformat()}
 
 
-@app.post("/replay/reset", tags=["replay"])
+@app.post("/replay/reset", tags=["live"])
 async def reset_replay(
-    clear_cover: bool = Query(False, description="Also reset the cover-fairness counter"),
+    clear_cover: bool = Query(False),
+    forget_recording: bool = Query(False, description="Also discard the playback recording"),
     scope: Scope = Depends(),
 ) -> dict[str, Any]:
-    """Rewind to the start of the morning and clear this shift's record."""
     from agent import runner as agent_runner
 
-    dropped = drop_session(
-        scope.business_unit, scope.office, scope.shift_date, scope.shift_type
-    )
-    if dropped:
-        # Clear the agent's transcripts too. Leaving them behind is how a demo
-        # run twice costs three times as much the second time.
-        await agent_runner.clear_conversations(dropped)
+    from app.sessions import session_key
 
+    dropped = drop_session(scope.business_unit, scope.office, scope.shift_date, scope.shift_type)
+    if dropped:
+        await agent_runner.clear_conversations(dropped)
+    if forget_recording:
+        rec.forget(session_key(scope.business_unit, scope.office, scope.shift_date, scope.shift_type), dropped)
     removed = store.reset_shift(scope.office, scope.shift_date, scope.shift_type)
     if clear_cover:
         store.clear_cover_log(scope.shift_date)
-
     fresh = scope.session()
-    return {
-        "status": "reset",
-        "alerts_cleared": removed,
-        "clock": fresh.replay.now.isoformat(),
-    }
+    return {"status": "reset", "alerts_cleared": removed, "clock": fresh.replay.now.isoformat()}
 
 
-@app.post("/replay/step", tags=["replay"])
-async def step_replay(
-    minutes: int = Query(5, ge=1, le=180),
-    scope: Scope = Depends(),
-) -> dict[str, Any]:
-    """Advance the clock by hand. Useful when presenting."""
+@app.post("/replay/step", tags=["live"])
+async def step_replay(minutes: int = Query(5, ge=1, le=180), scope: Scope = Depends()) -> dict[str, Any]:
+    """Advance the clock by hand without narrating. Handy from curl."""
     session = scope.session()
-    target = session.replay.now + timedelta(minutes=minutes)
-    for tick in session.replay.ticks():
-        if tick <= session.replay.now:
-            continue
-        if tick > target:
-            break
-        session.replay.advance(tick)
-    session.persist()
+    _advance_to(session, session.replay.now + timedelta(minutes=minutes))
     return {"status": "stepped", "clock": session.replay.now.isoformat()}
+
+
+def _restart(session: Session) -> Session:
+    """The clock only moves forward; rewinding means a fresh replay."""
+    r = session.replay
+    recording = session.recording
+    drop_session(r.business_unit, r.office, r.shift_date, r.shift_type)
+    store.reset_shift(r.office, r.shift_date, r.shift_type)
+    fresh = get_session(r.business_unit, r.office, r.shift_date, r.shift_type)
+    fresh.speed = session.speed
+    fresh.narrate = session.narrate
+    fresh.recording = recording  # keep capturing into the same recording
+    return fresh
 
 
 # ---------------------------------------------------------------------- views
@@ -317,59 +245,85 @@ async def step_replay(
 
 @app.get("/board", tags=["board"])
 async def board(scope: Scope = Depends()) -> dict[str, Any]:
-    """The shift board: clock, queues, impact, and every rider's position."""
     session = scope.session()
     payload = session.replay.board()
     payload["running"] = session.running
     payload["speed"] = session.speed
+    payload["narrating"] = session.narrating
+    payload["recording"] = session.recording.status() if session.recording else {"ready": False}
     return payload
+
+
+def _alerts_with_actions(session: Session) -> list[dict[str, Any]]:
+    session.persist()
+    taken = store.actions_for(list(session.alert_ids.values()))
+    out = []
+    for queue, alert in session.replay.alerts.items():
+        alert_id = session.alert_ids.get(queue)
+        out.append(alert.as_dict() | {"id": alert_id, "actions": _fmt_actions(taken.get(alert_id or -1, []))})
+    out.sort(key=lambda a: (a["status"] == "RESOLVED", a["opened_at"]))
+    return out
+
+
+def _fmt_actions(rows: list[dict[str, Any]], cutoff: str | None = None) -> list[dict[str, Any]]:
+    return [
+        {
+            "pathway": a["pathway"], "draft": a["draft"], "people": a["candidates"],
+            "cost": a["cost"], "sent_at": a["sent_at"].isoformat(),
+            "time": a["sent_at"].strftime("%H:%M"),
+        }
+        for a in rows
+        if cutoff is None or a["sent_at"].isoformat() <= cutoff
+    ]
 
 
 @app.get("/alerts", tags=["board"])
 async def alerts(scope: Scope = Depends()) -> dict[str, Any]:
-    """Open and resolved alerts, with whatever has already been done about them."""
     session = scope.session()
-    session.persist()
-    ids = list(session.alert_ids.values())
-    taken = store.actions_for(ids)
-
-    out = []
-    for queue, alert in session.replay.alerts.items():
-        alert_id = session.alert_ids.get(queue)
-        out.append(
-            alert.as_dict()
-            | {
-                "id": alert_id,
-                "actions": [
-                    {
-                        "pathway": a["pathway"],
-                        "draft": a["draft"],
-                        "people": a["candidates"],
-                        "cost": a["cost"],
-                        "sent_at": a["sent_at"].isoformat(),
-                        "time": a["sent_at"].strftime("%H:%M"),
-                    }
-                    for a in taken.get(alert_id or -1, [])
-                ],
-            }
-        )
-    out.sort(key=lambda a: (a["status"] == "RESOLVED", a["opened_at"]))
-    return {"clock": session.replay.now.isoformat(), "alerts": out}
+    return {"clock": session.replay.now.isoformat(), "alerts": _alerts_with_actions(session)}
 
 
 @app.get("/events", tags=["board"])
-async def events(
-    since: str | None = Query(None), scope: Scope = Depends()
-) -> dict[str, Any]:
-    """The feed. `since` is an ISO timestamp from a previous response."""
+async def events(since: str | None = Query(None), scope: Scope = Depends()) -> dict[str, Any]:
     session = scope.session()
     cutoff = datetime.fromisoformat(since) if since else None
-    feed = [
-        e.as_dict()
-        for e in session.replay.events
-        if cutoff is None or e.at > cutoff
-    ]
-    return {"clock": session.replay.now.isoformat(), "events": feed}
+    return {
+        "clock": session.replay.now.isoformat(),
+        "events": [e.as_dict() for e in session.replay.events if cutoff is None or e.at > cutoff],
+    }
+
+
+@app.get("/landmarks", tags=["board"])
+async def landmarks(scope: Scope = Depends()) -> dict[str, Any]:
+    """Story beats. From the recording if there is one, else from the live feed so far."""
+    session = scope.session()
+    r = session.replay
+    if session.recording and session.recording.ready:
+        marks = session.recording.landmarks(r.shift_start, r.deadline)
+        source = "recording"
+    else:
+        everyone = r.now.isoformat() if r.board()["totals"]["on_floor"] == len(r.legs) else None
+        marks = rec.derive_landmarks([e.as_dict() for e in r.events], r.shift_start, r.deadline, everyone)
+        source = "live"
+    return {"source": source, "landmarks": marks}
+
+
+@app.get("/at", tags=["playback"])
+async def at(t: str = Query(..., description="HH:MM"), scope: Scope = Depends()) -> dict[str, Any]:
+    """The board, alerts and feed as recorded at one minute. Playback only."""
+    session = scope.session()
+    recording = session.recording
+    if recording is None or not recording.ready:
+        raise HTTPException(409, "no recording yet; switch to Live and run the morning")
+    snap = recording.at(t)
+    taken = store.actions_for([a["id"] for a in snap["alerts"] if a.get("id")])
+    return {
+        "clock": snap["clock"],
+        "time": snap["time"],
+        "board": snap["board"],
+        "alerts": [a | {"actions": _fmt_actions(taken.get(a.get("id") or -1, []), snap["clock"])} for a in snap["alerts"]],
+        "events": snap["events"],
+    }
 
 
 # --------------------------------------------------------------------- acting
@@ -378,16 +332,10 @@ async def events(
 @app.post("/alerts/{alert_id}/act", tags=["act"])
 async def act(
     alert_id: int,
-    pathway: str = Query(..., description="Which option the manager chose"),
-    at: str | None = Query(None, description="HH:MM, when acting from the story slider"),
+    pathway: str = Query(...),
+    at: str | None = Query(None, description="HH:MM when acting from playback"),
     scope: Scope = Depends(),
 ) -> dict[str, Any]:
-    """Record a decision, and charge its cost to whoever absorbs it.
-
-    This is where the system stops describing and starts doing. The draft it
-    returns is the message the manager sends; the row it writes is what lets
-    tomorrow's alert know who covered today.
-    """
     session = scope.session(create=False)
     session.persist()
     found = session.alert_for(alert_id)
@@ -395,216 +343,73 @@ async def act(
         raise HTTPException(404, f"alert {alert_id} is not part of this shift")
     _, alert = found
 
-    # Acting from the story slider: use the alert as it stood at that minute,
-    # so the options offered and the draft written match what is on screen.
     when = session.replay.now
-    if at and session.timeline and session.timeline.ready:
-        snap = session.timeline.at(at)
-        if snap:
+    if at and session.recording and session.recording.ready:
+        snap = session.recording.at(at)
+        frozen = next((a for a in snap["alerts"] if a.get("id") == alert_id), None) if snap else None
+        if frozen:
             when = datetime.fromisoformat(snap["clock"])
-            frozen = next((a for a in snap["alerts"] if a.get("id") == alert_id), None)
-            if frozen:
-                from app.core.alerts import Option
-                alert.options = [
-                    Option(
-                        pathway=Pathway(o["pathway"]),
-                        label=o["label"],
-                        rationale=o["rationale"],
-                        people=o["people"],
-                        cost=o["cost"],
-                        recommended=o["recommended"],
-                    )
-                    for o in frozen["options"]
-                ]
-                alert.drafts = frozen.get("drafts") or {}
-                alert.impact = frozen.get("impact") or alert.impact
-                alert.coverage_pct = frozen.get("coverage_pct", alert.coverage_pct)
+            alert.options = [
+                Option(pathway=Pathway(o["pathway"]), label=o["label"], rationale=o["rationale"],
+                       people=o["people"], cost=o["cost"], recommended=o["recommended"],
+                       urgent=o.get("urgent", False))
+                for o in frozen["options"]
+            ]
+            alert.drafts = frozen.get("drafts") or {}
+            alert.impact = frozen.get("impact") or alert.impact
+            alert.coverage_pct = frozen.get("coverage_pct", alert.coverage_pct)
 
     try:
         chosen = Pathway(pathway)
     except ValueError:
         raise HTTPException(400, f"unknown pathway {pathway!r}")
-
     option = next((o for o in alert.options if o.pathway is chosen), None)
     if option is None:
-        offered = [o.pathway.value for o in alert.options]
-        raise HTTPException(
-            409, f"{pathway} is not currently offered on this alert; options are {offered}"
-        )
+        raise HTTPException(409, f"{pathway} is not offered; options are {[o.pathway.value for o in alert.options]}")
 
     draft = alert.drafts.get(chosen.value) or _fallback_draft(alert, option)
-
-    # Cover minutes are charged only to people actually moved onto the queue.
-    # Escalations and phone calls cost somebody's attention, not their shift.
     if chosen in {Pathway.EARLY_SHIFT_COVER, Pathway.CROSS_COVER}:
         movers = [p["stwid"] for p in option.people if p.get("stwid")]
         minutes = round((alert.impact.get("minutes_lost") or 0) / max(1, len(movers)))
         if movers:
             record_cover(movers, scope.shift_date, minutes)
 
-    action = store.record_action(
-        alert_id=alert_id,
-        pathway=chosen.value,
-        draft=draft,
-        people=option.people,
-        at=when,
-        cost=option.cost,
-    )
-    return {
-        "status": "recorded",
-        "pathway": chosen.value,
-        "draft": draft,
-        "people": option.people,
-        "sent_at": action["sent_at"].isoformat(),
-    }
+    action = store.record_action(alert_id, chosen.value, draft, option.people, when, option.cost)
+    return {"status": "recorded", "pathway": chosen.value, "draft": draft,
+            "people": option.people, "sent_at": action["sent_at"].isoformat()}
 
 
-def _fallback_draft(alert: Alert, option) -> str:
-    """A usable message when no model has written one.
-
-    The board must never show an empty action. If the narrative layer is down
-    or has not run for this situation yet, the structured payload is still
-    enough to compose something a manager could actually send.
-    """
-    names = ", ".join(
-        str(p.get("name") or p.get("vendor") or p.get("role")) for p in option.people
-    ) or "the team"
+def _fallback_draft(alert: Alert, option: Option) -> str:
+    """A sendable message when the model has not written one."""
+    names = ", ".join(str(p.get("name") or p.get("vendor") or p.get("role")) for p in option.people) or "the team"
     when = alert.updated_at.strftime("%H:%M")
-
+    q, shift = alert.display_name, alert.shift_type
     if option.pathway is Pathway.EARLY_SHIFT_COVER:
-        return (
-            f"{alert.display_name} is {alert.coverage_pct}% staffed for the "
-            f"{alert.shift_type} start. Could {names} move onto the queue until "
-            f"the {alert.shift_type} team is in? Asking at {when}."
-        )
+        return f"{q} is {alert.coverage_pct}% staffed for the {shift} start. Could {names} move onto the queue until the {shift} team is in? Asking at {when}."
     if option.pathway is Pathway.CROSS_COVER:
-        return (
-            f"{alert.display_name} is short and its own cover pool is exhausted. "
-            f"Requesting {names} from the adjacent queue, accepting slower handling."
-        )
+        return f"{q} is short and its own cover pool is exhausted. Requesting {names} from the adjacent queue, accepting slower handling."
     if option.pathway is Pathway.HOLD_OVER:
-        cost = option.cost or {}
-        return (
-            f"{names}: please hold your positions past shift end. "
-            f"{cost.get('summary', '')}. Relief is en route."
-        )
+        return f"{names}: please hold your positions past shift end. {(option.cost or {}).get('summary', '')}. Relief is en route."
     if option.pathway is Pathway.CONTACT_EMPLOYEE:
-        return (
-            f"No pickup recorded for {names} on the {alert.shift_type} run. "
-            f"Please confirm whether they are travelling."
-        )
+        return f"No pickup recorded for {names} on the {shift} run. Please confirm whether they are travelling."
     if option.pathway is Pathway.ESCALATE_TRANSPORT:
-        return (
-            f"{alert.display_name} at {alert.office}: several riders affected on "
-            f"{names} this morning. Raising for the {alert.shift_date} record."
-        )
+        return f"{q} at {alert.office}: several riders affected on {names} this morning. Raising for the {alert.shift_date} record."
     if option.pathway is Pathway.ESCALATE_OPS:
         day = (alert.impact.get("day") or {}).get("headline", "")
-        return (
-            f"{alert.display_name}, {alert.shift_date}: {day}. "
-            f"Cause: {alert.cause.value.replace('_', ' ').lower()}. "
-            f"Flagging now rather than in the evening report."
-        )
-    return f"{alert.display_name}: holding at {alert.coverage_pct}% and watching."
+        return f"{q}, {alert.shift_date}: {day}. Cause: {alert.cause.value.replace('_', ' ').lower()}. Flagging now rather than in the evening report."
+    return f"{q}: holding at {alert.coverage_pct}% and watching."
 
 
-# ---------------------------------------------------------------------- chat
-
-
-# ------------------------------------------------------------------ story
-
-
-@app.post("/timeline/build", tags=["story"])
-async def build_timeline(
-    narrate: bool = Query(True, description="Write up alerts as they open"),
-    scope: Scope = Depends(),
-) -> dict[str, Any]:
-    """Capture the whole morning, tick by tick, so a slider can scrub it.
-
-    Runs in the background. Poll /timeline/status. The first build narrates
-    each alert as it opens and takes a couple of minutes; a rebuild hits the
-    narrative memo and takes a few seconds.
-    """
-    from app import timeline as tl
-
-    session = scope.session()
-    if session.timeline and session.timeline.building:
-        return {"status": "already building", **session.timeline.status()}
-    if session.task and not session.task.done():
-        session.task.cancel()
-        session.running = False
-    asyncio.create_task(tl.build(session, narrate=narrate))
-    await asyncio.sleep(0)
-    return {"status": "building", **(session.timeline.status() if session.timeline else {})}
-
-
-@app.get("/timeline/status", tags=["story"])
-async def timeline_status(scope: Scope = Depends()) -> dict[str, Any]:
-    session = scope.session()
-    if session.timeline is None:
-        return {"building": False, "ready": False, "ticks_done": 0, "ticks_total": 0, "landmarks": []}
-    return session.timeline.status()
-
-
-@app.get("/timeline", tags=["story"])
-async def timeline_at(
-    at: str = Query(..., description="HH:MM"), scope: Scope = Depends()
-) -> dict[str, Any]:
-    """The board, alerts and feed as they were at one minute of the morning.
-
-    Actions the presenter takes are live, not part of the capture, so they are
-    merged in here and filtered to what had been sent by that minute.
-    """
-    session = scope.session()
-    timeline = session.timeline
-    if timeline is None or not timeline.ready:
-        raise HTTPException(409, "the timeline has not been built; POST /timeline/build first")
-    snap = timeline.at(at)
-    if snap is None:
-        raise HTTPException(404, f"no snapshot at {at}")
-
-    ids = [a["id"] for a in snap["alerts"] if a.get("id")]
-    taken = store.actions_for(ids)
-    cutoff = snap["clock"]
-    alerts = []
-    for alert in snap["alerts"]:
-        actions = [
-            {
-                "pathway": a["pathway"],
-                "draft": a["draft"],
-                "people": a["candidates"],
-                "cost": a["cost"],
-                "sent_at": a["sent_at"].isoformat(),
-                "time": a["sent_at"].strftime("%H:%M"),
-            }
-            for a in taken.get(alert.get("id") or -1, [])
-            if a["sent_at"].isoformat() <= cutoff
-        ]
-        alerts.append(alert | {"actions": actions})
-    return {
-        "clock": snap["clock"],
-        "time": snap["time"],
-        "board": snap["board"],
-        "alerts": alerts,
-        "events": snap["events"],
-        "landmarks": [m.as_dict() for m in timeline.landmarks],
-    }
+# ---------------------------------------------------------------------- agent
 
 
 @app.post("/chat", tags=["agent"])
 async def chat(body: dict = Body(...), scope: Scope = Depends()) -> dict[str, Any]:
-    """Ask the agent about the shift.
-
-    Shares one conversation per shift-day with the proactive alerts, so a
-    manager asking "why is billing short" gets an answer from something that
-    already wrote the alert rather than from a stranger.
-    """
     from agent import runner as agent_runner
 
     text = (body or {}).get("text", "").strip()
     if not text:
         raise HTTPException(400, "send a question as {'text': ...}")
-
     session = scope.session()
     session.persist()
     answer = await agent_runner.ask(session, text)
@@ -613,7 +418,6 @@ async def chat(body: dict = Body(...), scope: Scope = Depends()) -> dict[str, An
 
 @app.post("/alerts/{alert_id}/narrate", tags=["agent"])
 async def narrate(alert_id: int, scope: Scope = Depends()) -> dict[str, Any]:
-    """Write up one alert on demand. Used by the demo and by tests."""
     from agent import runner as agent_runner
 
     session = scope.session()
@@ -622,31 +426,26 @@ async def narrate(alert_id: int, scope: Scope = Depends()) -> dict[str, Any]:
     if found is None:
         raise HTTPException(404, f"alert {alert_id} is not part of this shift")
     _, alert = found
-
-    written = await agent_runner.compose(session, alert)
+    written = await agent_runner.compose(session, alert, fresh=True)
     session.persist()
-    return {
-        "status": "written" if written else "unavailable",
-        "narrative": alert.narrative,
-        "drafts": alert.drafts,
-        "usage": agent_runner.USAGE.as_dict(),
-    }
+    return {"status": "written" if written else "unavailable", "narrative": alert.narrative,
+            "drafts": alert.drafts, "usage": agent_runner.USAGE.as_dict()}
 
 
 @app.get("/usage", tags=["agent"])
 async def usage() -> dict[str, Any]:
-    """What inference has cost this process. The cost claim, metered."""
     from agent import runner as agent_runner
 
     return agent_runner.USAGE.as_dict()
 
+
+# ------------------------------------------------------------------------ ops
 
 WEB = Path(__file__).resolve().parent.parent / "web" / "index.html"
 
 
 @app.get("/", include_in_schema=False)
 async def board_page() -> FileResponse:
-    """The shift board. One file, no build step, served by the same process."""
     return FileResponse(WEB, media_type="text/html")
 
 
@@ -655,8 +454,8 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "sessions": [
-            {"key": k, "clock": s.replay.now.isoformat(), "running": s.running}
+            {"key": k, "clock": s.replay.now.isoformat(), "running": s.running,
+             "narrating": s.narrating, "recording": bool(s.recording and s.recording.ready)}
             for k, s in SESSIONS.items()
         ],
     }
-

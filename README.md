@@ -47,35 +47,35 @@ open http://localhost:8000
 Config lives in `app/config.py` and is overridable by environment variable. The demo defaults to `pinnacle-Slc`, `Clearwater Campus`, the `09:00` shift, on `2026-06-11`.
 
 ```bash
-uv run pytest tests/ -m "not live"    # 112 tests, no model calls, ~35s
+uv run pytest tests/ -m "not live"    # 106 tests, no model calls, ~50s
 uv run pytest tests/test_agent.py -m live   # 3 tests against the real model
 ```
 
-## Telling it as a story
+## Live and playback
 
-Press **Prepare the story** once before you present. It captures every minute from 07:30 to 10:00 and writes up each alert as it opens, in order, waiting for each write-up so the snapshot at 08:25 carries the prose that was written at 08:25. About two minutes the first time; a rebuild reuses the written prose and takes a few seconds.
+One slider, one switch.
 
-Then a slider appears with the morning's landmarks marked on it. Drag it, click a dot, or use the left and right arrow keys to step between landmarks. Every minute shows exactly what the manager would have seen: the board, the alerts, the feed, and anything you have already sent. Clicking an option while scrubbing records the decision at that minute of the story.
+**Live on.** The clock is real and the model is called fresh every time. Click a dot on the slider to run the morning forward to that minute in about a second, then watch the agent write up whatever is open. The clock pauses while it writes, about fifteen seconds, and the panel says so. Press Play to run the whole morning instead. Everything a live run does is captured minute by minute.
 
-The landmarks are read off the event feed, not hand-placed:
+**Live off.** The slider plays back the last live run. Instant, no compute, no model. Press Play to animate through it. If nothing has been recorded yet the panel says so and points at the switch.
 
-| Time | Landmark |
-|---|---|
-| 07:40 | First cab fails to leave: Agent 20 |
-| 08:01 | Technical Support alert opens |
-| 08:25 | Agent 09 not collected |
-| 08:47 | Agent 15 not collected |
-| 08:49 | First arrival: Agent 22 |
-| 09:00 | Shift starts |
-| 09:05 | Grace period ends |
-| 09:19 | Billing Support back to strength |
-| 09:55 | Technical Support back to strength |
+Left and right arrow keys step between landmarks in either mode. Clicking an option records the decision at the minute on screen.
 
-This is precomputed, and that is not a trick. Every snapshot is the same deterministic function the live clock runs, evaluated at that minute, with the same guard against reading the future. The narratives are real model output produced in order. **Back to live** returns to the running clock at any time.
+## The designed morning
+
+The demo runs on a designed Thursday, 6 August 2026, built in the dataset's own schema by `db/seed_story.py`. The rows are fabricated and say so. The three months of real history still feed every benchmark. Set `BESSEMER_DEMO_DATE=2026-06-11` to run the real day instead.
+
+| Time | What happens | What the agent does |
+|---|---|---|
+| 07:30 | Quiet. One tech agent on booked leave. | Nothing. No alert, no model call. |
+| 08:05 | One vendor's cab has not left. Four billing riders `CAB_LATE`, coverage 67%. | Alert opens, cause `CAB_NOT_STARTED`, vendor named for escalation. Cover not offered: nobody from 08:30 is in yet. |
+| 08:30 | Two tech riders' cab came and went without them. Three seats gone on a queue with one agent of headroom. | Cause `ABSENCE`. Call them. Cover offered. The day cannot reach 80%, so operations is flagged as urgent, an hour before the shift starts. |
+| 08:55 | 13 of 24 on the floor. Billing 67%, service level 15%, day still holds. | Four priced options. Cover from four named early-shift agents is green. Hold-over costs four night agents their cab home. |
+| 09:30 | Billing's cab lands. Tech support is 9 of 12 and stays there. | Billing resolves itself. Tech stays open with the day at 53%, unrecoverable. |
 
 ## The demo, in six beats
 
-Press **Run the morning** and watch, or press **Jump to 08:55** to open on the worst of it. Or prepare the story and step through the landmarks above.
+Switch Live on and click the dots in order.
 
 1. **07:45.** Board green. 24 rostered, nobody due yet.
 2. **08:12.** The cab for Agent 20 has not left its depot, 32 minutes late. First amber.
@@ -140,7 +140,8 @@ Where the model sits: only in the bottom box, only when an alert opens, resolves
 | `app/core/remediation.py` | Cover candidates verified on the floor; hold-over priced. |
 | `app/core/alerts.py` | Triggers, cause, lifecycle with hysteresis, options scored on the contract. |
 | `app/replay.py` | The clock. |
-| `app/timeline.py` | The morning captured tick by tick, with landmarks derived from the feed. |
+| `app/recording.py` | Every live tick captured for playback, landmarks derived from the feed. |
+| `db/seed_story.py` | The designed morning, in the dataset's schema. |
 | `app/api.py` | Fourteen endpoints, all scoped by tenant, site, date and shift. |
 | `agent/` | Tools, two agents, runner, metered usage. |
 | `web/index.html` | The board. One file, no build step. |

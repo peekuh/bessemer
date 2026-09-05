@@ -36,7 +36,7 @@ from app.core.sla import (
     project_day,
     service_level,
 )
-from app.core.state import State, rider_state
+from app.core.state import State, pickup_delay_min, rider_state
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,11 @@ class RiderStatus:
     trip_nodal: str | None = None
     minutes_late: float | None = None
     """Projected minutes past the deadline. Negative means comfortably early."""
+
+    pickup_delay_min: float = 0.0
+    """How late the rider's pickup is or was, as observable at `now`. Separates
+    "the cab reached them late" from "the journey ran long", which are
+    different causes with different owners."""
 
     @property
     def on_floor(self) -> bool:
@@ -77,6 +82,23 @@ class RiderStatus:
         if self.state.is_absent:
             return False
         return self.minutes_late is not None and self.minutes_late <= 0
+
+    @property
+    def is_affected(self) -> bool:
+        """Belongs in the alert: not projected to make it, or unaccounted for.
+
+        Judged on the median projection, the same basis as coverage and the
+        queue-card buckets. An earlier version used the pessimistic band here,
+        and because the plan leaves five minutes of slack against thirteen of
+        noise, that swept every travelling rider into the affected set. The
+        side effects were not cosmetic: the vendor named for escalation was
+        whichever ordinary cab happened to sort first, and a queue with three
+        confirmed absences was diagnosed as an en-route delay because nine
+        on-time riders outvoted them.
+        """
+        if self.on_floor:
+            return False
+        return self.state.is_uncertain or not self.expected
 
     @property
     def needs_attention(self) -> bool:
@@ -408,6 +430,7 @@ def status_for(leg: Mapping[str, Any], now: datetime, office: str, deadline: dat
     """Resolve one rider's row into a status at `now`."""
     projection = project_arrival(leg, now, office, deadline)
     return RiderStatus(
+        pickup_delay_min=pickup_delay_min(leg, now),
         stwid=leg["stwid"],
         display_name=leg["display_name"],
         queue=leg["queue"],

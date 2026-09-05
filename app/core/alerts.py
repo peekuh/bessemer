@@ -149,6 +149,9 @@ class Option:
     people: list[dict[str, Any]] = field(default_factory=list)
     cost: dict[str, Any] | None = None
     recommended: bool = False
+    urgent: bool = False
+    """Must happen regardless of which staffing option is chosen. Escalating a
+    lost day is not an alternative to covering the queue; it is in addition."""
     agents_after: float | None = None
     service_level: ServiceLevel | None = None
 
@@ -167,6 +170,7 @@ class Option:
             "people": self.people,
             "cost": self.cost,
             "recommended": self.recommended,
+            "urgent": self.urgent,
             "agents_after": self.agents_after,
             "service_level": self.service_level.as_dict() if self.service_level else None,
             "outcome": self.outcome,
@@ -423,10 +427,13 @@ def evaluate_triggers(projection: QueueProjection, resolving: bool = False) -> l
     floor = STAFFING_FLOOR + (RESOLVE_MARGIN if resolving else 0.0)
 
     if projection.coverage < floor:
-        fired.append(
-            f"coverage {round(projection.coverage * 100)}% below the "
-            f"{round(STAFFING_FLOOR * 100)}% floor"
-        )
+        pct = round(projection.coverage * 100)
+        if pct < round(STAFFING_FLOOR * 100):
+            fired.append(f"coverage {pct}% below the {round(STAFFING_FLOOR * 100)}% floor")
+        else:
+            fired.append(
+                f"coverage {pct}% has not recovered past {round(floor * 100)}%"
+            )
 
     still_out = [r for r in projection.riders if not r.on_floor]
 
@@ -448,9 +455,19 @@ def evaluate_triggers(projection: QueueProjection, resolving: bool = False) -> l
     return fired
 
 
+LATE_PICKUP_MIN = 10.0
+"""A pickup this far behind plan is the cause of a late arrival, not the road."""
+
+
 def classify(projection: QueueProjection) -> Cause:
-    """Name the dominant cause from observable state, never from `delay_reason`."""
-    affected = [r for r in projection.riders if not r.expected or r.needs_attention]
+    """Name the dominant cause from observable state, never from `delay_reason`.
+
+    The progression for one late cab reads: CAB_NOT_STARTED while it sits at
+    the depot, LATE_PICKUP once it is moving or has collected people well
+    behind plan, EN_ROUTE_DELAY only when the pickup was on time and the
+    journey itself ran long. Each names a different owner.
+    """
+    affected = [r for r in projection.riders if r.is_affected]
     if not affected:
         return Cause.MIXED
 
@@ -462,10 +479,12 @@ def classify(projection: QueueProjection) -> Cause:
             cause = Cause.NO_PICKUP
         elif rider.state is State.CAB_LATE:
             cause = Cause.CAB_NOT_STARTED
+        elif rider.state is State.CAB_MOVING:
+            # The cab is running behind before it has reached anyone.
+            cause = Cause.LATE_PICKUP
         elif rider.state is State.PICKED_UP:
-            # Aboard and late: was the arrival lost at the kerb or on the road?
-            late_start = (rider.projection.basis or "").startswith("expected")
-            cause = Cause.LATE_PICKUP if late_start else Cause.EN_ROUTE_DELAY
+            late_kerb = rider.pickup_delay_min > LATE_PICKUP_MIN
+            cause = Cause.LATE_PICKUP if late_kerb else Cause.EN_ROUTE_DELAY
         else:
             cause = Cause.EN_ROUTE_DELAY
         tally[cause] = tally.get(cause, 0) + 1
@@ -639,7 +658,9 @@ def build_options(
                     + " Operations should hear this now, not in the evening report."
                 ),
                 people=[{"role": "operations head", "reason": day.headline}],
-                recommended=not day.recoverable,
+                # Not an alternative to fixing the floor, so never the single
+                # recommended action. Urgent instead: it happens as well.
+                urgent=True,
             )
         )
 
@@ -657,7 +678,9 @@ def _repeat_vendors(riders: Sequence[RiderStatus], minimum: int = 2) -> list[tup
     """
     tally: dict[str, int] = {}
     for rider in riders:
-        if rider.vendor_id and (not rider.expected or rider.needs_attention):
+        # Only transport-caused trouble counts against a vendor. A rider who
+        # was not at their stop, or who cancelled, is not the cab's fault.
+        if rider.vendor_id and rider.is_affected and not rider.state.is_absent:
             tally[rider.vendor_id] = tally.get(rider.vendor_id, 0) + 1
     return sorted(
         ((v, n) for v, n in tally.items() if n >= minimum),
@@ -720,7 +743,7 @@ def build_alert(
     affected = [
         r.as_dict()
         for r in sorted(
-            (r for r in projection.riders if not r.expected or r.needs_attention),
+            (r for r in projection.riders if r.is_affected),
             key=lambda r: (r.projection.eta or datetime.max, r.display_name),
         )
     ]

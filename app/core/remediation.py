@@ -47,6 +47,9 @@ from app.config import (
 from app.core.state import State, rider_state
 from app.db import query
 
+SHIFT_HOURS = 8.0
+"""How long a night agent is held if their relief never comes at all."""
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -201,9 +204,11 @@ class HoldOver:
     def summary(self) -> str:
         if not self.agents_held:
             return "no hold-over needed"
+        each = round(self.minutes / max(1, self.agents_held))
+        span = f"{each} min" if each < 120 else f"{each / 60:.0f} hours"
         parts = [
             f"{self.agents_held} night agent{'s' if self.agents_held > 1 else ''} "
-            f"held {round(self.minutes / max(1, self.agents_held))} min past shift end"
+            f"held {span} past shift end"
         ]
         if self.missed_cabs:
             parts.append(
@@ -242,7 +247,17 @@ def hold_over_cost(
         gap_size: how many positions are unrelieved.
         recovered_by: when the last late rider is projected to land.
     """
-    if gap_size <= 0 or recovered_by is None or recovered_by <= shift_start:
+    if gap_size <= 0:
+        return HoldOver(0, 0.0, 0.0, None, 0)
+
+    # No projected arrival means nobody is coming: a confirmed no-show or a
+    # cancellation. Under positional handover the seat still has to be held,
+    # and it has to be held for the whole shift. An earlier version returned a
+    # zero cost here, which made a permanent absence look cheaper than a
+    # twenty-minute delay.
+    if recovered_by is None:
+        recovered_by = shift_start + timedelta(hours=SHIFT_HOURS)
+    if recovered_by <= shift_start:
         return HoldOver(0, 0.0, 0.0, None, 0)
 
     available = query(
