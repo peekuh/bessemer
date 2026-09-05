@@ -30,6 +30,10 @@
   }
 
   * { box-sizing: border-box; }
+  /* An author `display` rule beats the browser's default `[hidden]{display:none}`.
+     The writing indicator is `display:inline-flex`, so setting .hidden did
+     nothing visible for four rounds of "fixes". This wins over everything. */
+  [hidden] { display: none !important; }
   html, body { margin: 0; background: var(--ground); color: var(--ink); }
   body {
     font-family: var(--sans);
@@ -623,13 +627,17 @@
   }
 
   async function act(alert, pathway) {
-    const when = story ? `&at=${storyTime}` : "";
-    const r = await post(`/alerts/${alert.id}/act?pathway=${encodeURIComponent(pathway)}${when}`);
-    if (r.status === "recorded") {
-      toast(`${PATHWAY[pathway]} sent`);
-      if (story) await showStoryAt(storyTime); else await refresh();
-    } else {
-      toast(r.detail || "Could not record that");
+    const when = live ? "" : `&at=${cursor}`;
+    try {
+      const r = await post(`/alerts/${alert.id}/act?pathway=${encodeURIComponent(pathway)}${when}`);
+      if (r.status === "recorded") {
+        toast(`${PATHWAY[pathway]} sent`);
+        if (live) await refresh(); else await showRecorded(cursor);
+      } else {
+        toast(r.detail || "Could not record that");
+      }
+    } catch (e) {
+      toast("Could not reach the server");
     }
   }
 
