@@ -73,16 +73,17 @@ The demo runs on a designed Thursday, 6 August 2026, built in the dataset's own 
 | 08:55 | 13 of 24 on the floor. Billing 67%, service level 15%, day still holds. | Four priced options. Cover from four named early-shift agents is green. Hold-over costs four night agents their cab home. |
 | 09:30 | Billing's cab lands. Tech support is 9 of 12 and stays there. | Billing resolves itself. Tech stays open with the day at 53%, unrecoverable. |
 
-## The demo, in six beats
+## The demo, in five stops
 
-Switch Live on and click the dots in order.
+The slider has five stops, one per row of the table above. Rehearse once with Live on so the model writes each alert and the run is recorded; present with Live off so every stop is instant.
 
-1. **07:45.** Board green. 24 rostered, nobody due yet.
-2. **08:12.** The cab for Agent 20 has not left its depot, 32 minutes late. First amber.
-3. **08:25.** Billing Support alert opens at 92% projected coverage. The narrative arrives a few seconds later.
-4. **08:47.** Agent 15 not collected, cab has passed. The alert now offers "Call the unaccounted riders".
-5. **08:55.** Billing at 67%, service level 15%. Click **Move the early shift onto the queue**. The draft appears under Sent, naming four people who are verifiably on the floor.
-6. **09:19.** Billing back to 83%. The alert resolves itself. Ask the chat: *"Who covered this morning, and how much overtime did we avoid?"*
+1. **07:30.** Green board, 24 rostered, nobody due. Say: the agent has nothing to say and does not say it. No alert, no model call.
+2. **08:05.** One vendor's shared cab has not left its depot. Four billing riders amber, coverage 67%. The alert opens on cause `CAB_NOT_STARTED` and names the vendor. Say: nobody from the early shift is in the building yet, so the agent does not offer cover it cannot deliver; it offers the escalation instead.
+3. **08:30.** Two tech riders' cab came and went without them. Confirmed absences on a queue with one agent of headroom. Say: the day cannot reach 80% and the agent flags operations now, an hour before the shift starts. Show the urgent `ESCALATE_OPS` option and the "Call the unaccounted riders" option side by side.
+4. **08:55.** Thirteen of 24 on the floor. Billing 67%, service level 15%, day still holds. Click **Move the early shift onto the queue**. The draft lands under Sent naming four people whose arrival is recorded. Then point at hold-over: four night agents miss their cab home if nobody acts.
+5. **09:30.** Billing's cab lands and the alert resolves itself. Tech support sits at 9 of 12 with the day at 53% and stays there. Ask the chat: *"What did this morning cost, and what did we avoid by moving the early shift?"*
+
+The landmarks the recording derives on its own, for when a judge asks what happened between the stops: first cab fails to leave at 07:50, billing alert opens 08:01, Agents 16 and 20 not collected at 08:17 and 08:21, first arrival 08:49, shift starts 09:00, grace ends 09:05, billing back to strength 09:30. Left and right arrow keys step through them.
 
 ## How it is built
 

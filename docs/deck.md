@@ -49,7 +49,9 @@ Clock, headcount, two queue cards with service level, every rider's position, an
 
 ## 7. The alert, read aloud
 
-> Billing Support is four agents short until 09:19. Service level is 15% now, and the day's 80% target still holds. This is tracking towards 5 late, about the usual 5 for this team. Recommend early-shift cover from Agent 27, 29, 35 and 31. If nobody acts, 4 night agents are held 19 min past shift end and 4 would miss the 09:15 cab home.
+> Billing Support is four short until 09:30. Service is 15% now, and the day's target still holds. Move Agent 35, Agent 27, Agent 31, and Agent 29 to Billing Support.
+
+And beside it, the option nobody chose, priced: four night agents held 31 minutes past shift end, four miss the 09:15 cab home, overtime about 1301.
 
 Every number computed. Every name real. The model chose the order and wrote the sentences.
 
@@ -91,6 +93,12 @@ Postgres for everything, including agent sessions. Every table and endpoint keye
 
 Cut, deliberately: GPS, vendor contact, HR overtime rules, authentication, the other two personas.
 
-## Then: live demo
+## Then: the demo
 
-Six beats, three minutes. Jump to 08:55, read the alert, click cover, show the draft, ask the chat one question, let it resolve.
+Five stops on the slider, three minutes, Live off so every stop is instant. Rehearse once beforehand with Live on so the model has written each alert and the run is recorded.
+
+1. 07:30, nothing to say and it says nothing.
+2. 08:05, one vendor's cab has not left; the alert names the vendor and withholds cover it cannot deliver.
+3. 08:30, two confirmed absences; the day is lost and operations is flagged an hour early.
+4. 08:55, click cover, show the draft, point at what hold-over would have cost.
+5. 09:30, billing resolves itself, tech does not; ask the chat what the morning cost.
